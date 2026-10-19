@@ -24,6 +24,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -447,6 +448,56 @@ try:
 except Exception as e:
     ok, bogus = False, str(e)
 check("a malformed candidate renders instead of crashing the panel", ok, str(bogus))
+
+
+# ===========================================================================
+section("model output validation")
+# All nonempty extraction/screening responses are mocked: never call a model.
+def extracted_response(response):
+    with patch.object(extract.llm, "cached", return_value=response):
+        try:
+            return extract.extract("offline test input"), None
+        except Exception as exc:
+            return ({}, {}), str(exc)
+
+validated, error = extracted_response({
+    "present": [{"id": "fever", "evidence": "  "}],
+    "absent": [{"id": "cough", "evidence": ""}],
+})
+check("findings with empty evidence quotes are dropped", not error and validated == ({}, {}), str(validated))
+validated, error = extracted_response({
+    "present": [{"id": "fever", "evidence": "fever"}, {"id": "cough", "evidence": "cough"}],
+    "absent": [{"id": "fever", "evidence": "no fever"}],
+})
+check("conflicting present and absent IDs become unknown with no quote",
+      not error and validated == ({"cough": True}, {"cough": "cough"}), str(validated))
+validated, error = extracted_response({
+    "present": [{"id": "fever", "evidence": "fever"}],
+    "absent": [{"id": "fever", "evidence": ""}],
+})
+check("a conflicting ID is unknown even when one quote is empty",
+      not error and validated == ({}, {}), str(validated))
+validated, error = extracted_response({
+    "present": [None, "fever", 7, [], {}, {"id": 7, "evidence": "x"},
+                {"id": "fever", "evidence": ["x"]}, {"id": "cough", "evidence": "cough"}],
+    "absent": {"id": "fever", "evidence": "no fever"},
+})
+check("malformed extraction entries are skipped while valid entries survive",
+      not error and validated == ({"cough": True}, {"cough": "cough"}), error or str(validated))
+validated, error = extracted_response(["not an extraction object"])
+check("a malformed extraction response does not crash",
+      not error and validated == ({}, {}), error or str(validated))
+for raw, expected_clinical in [("false", False), (" FALSE ", False), ("true", True), (False, False), (True, True)]:
+    with patch.object(extract.llm, "cached", return_value={"clinical": raw, "kind": "test document"}):
+        screened = extract.screen_document("offline OCR test")
+    check(f"document screening parses {raw!r} as {expected_clinical}", screened["clinical"] is expected_clinical)
+with patch.object(extract.llm, "cached", return_value=["malformed screen response"]):
+    try:
+        screened, error = extract.screen_document("offline OCR test"), None
+    except Exception as exc:
+        screened, error = {}, str(exc)
+check("malformed screening output keeps the document visibly unscreened",
+      not error and screened == {"clinical": True, "kind": "not screened"}, error or str(screened))
 
 
 # ===========================================================================
