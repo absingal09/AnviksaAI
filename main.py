@@ -68,6 +68,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
 
 import capture
 import extract
@@ -165,6 +166,8 @@ async def capture_only(request: Request):
 
         doc_uploads = form.getlist("documents")
         if doc_uploads:
+            if any(not isinstance(upload, UploadFile) for upload in doc_uploads):
+                raise HTTPException(502, "Malformed document request: documents must be file uploads")
             docs_meta = []
             for doc_upload in doc_uploads:
                 name = getattr(doc_upload, "filename", "") or "document"
@@ -184,28 +187,30 @@ async def capture_only(request: Request):
             async def _scan(name, path):
                 try:
                     result = await run_in_threadpool(capture.read_image, str(path))
-                except Exception as e:
-                    raise RuntimeError(f"{name}: {e}") from e
-                text = result["text"]
-                # Screened per document, HERE, because this is the last point
-                # at which per-document text exists. /analyze concatenates
-                # everything into one blob, after which a game screenshot's
-                # words are indistinguishable from a prescription's — which
-                # is exactly how one changed the candidate list.
-                screen = await run_in_threadpool(extract.screen_document, text)
-                return name, text, screen
+                    text = result["text"]
+                    # Screened per document, HERE, because this is the last point
+                    # at which per-document text exists. /analyze concatenates
+                    # everything into one blob, after which a game screenshot's
+                    # words are indistinguishable from a prescription's — which
+                    # is exactly how one changed the candidate list.
+                    screen = await run_in_threadpool(extract.screen_document, text)
+                    return {"name": name, "chars": len(text), "text": text,
+                            "clinical": screen["clinical"], "kind": screen["kind"]}
+                except Exception as exc:
+                    traceback.print_exc()
+                    return {"name": name, "status": "error", "clinical": False,
+                            "chars": 0, "text": "", "kind": "could not be read",
+                            "error": f"Could not read document ({type(exc).__name__}). Try scanning it again."}
 
+            scans = asyncio.gather(*[_scan(n, p) for n, p in docs_meta])
             try:
-                results = await asyncio.gather(*[_scan(n, p) for n, p in docs_meta])
-            except Exception as e:
-                traceback.print_exc()
-                raise HTTPException(502, f"document scan failed for {e}")
+                results = await asyncio.shield(scans)
+            finally:
+                # Even a cancelled request must wait for its worker threads
+                # before the outer finally deletes their input files.
+                await scans
 
-            return {"scanned_documents": [
-                {"name": name, "chars": len(text), "text": text,
-                 "clinical": screen["clinical"], "kind": screen["kind"]}
-                for name, text, screen in results
-            ]}
+            return {"scanned_documents": results}
 
         raise HTTPException(400, "/capture requires an 'audio' file or 'documents' files")
     finally:

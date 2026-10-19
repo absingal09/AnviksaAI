@@ -20,6 +20,7 @@ happens no amount of green output here means the panel is useful. Do not read
 a pass as a safety claim.
 """
 
+import asyncio
 import base64
 import io
 import json
@@ -29,6 +30,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -1224,6 +1226,200 @@ with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-unrated-")
                 failed_log_payload, error = {}, str(exc)
         check("a log write failure is reported without hiding the clinical panel",
               not error and bool(failed_log_payload.get("unrated")) and "log" in log_error.getvalue().lower(), error or log_error.getvalue())
+
+
+# ===========================================================================
+section("document scan failures stay local to each file")
+
+
+async def exercise_document_batches():
+    loop = asyncio.get_running_loop()
+    failure_seen = asyncio.Event()
+    release = threading.Event()
+    started = threading.Barrier(3, timeout=5)
+    finished = threading.Event()
+    lock = threading.Lock()
+    paths, finished_count = [], 0
+
+    def read_one(path):
+        nonlocal finished_count
+        path = Path(path)
+        marker = path.read_text(encoding="utf-8")
+        with lock:
+            paths.append(path)
+        try:
+            started.wait()
+            if marker == "broken":
+                loop.call_soon_threadsafe(failure_seen.set)
+                raise RuntimeError("offline OCR failure")
+            if not release.wait(timeout=5):
+                raise RuntimeError("offline scan was not released")
+            return {"text": path.read_text(encoding="utf-8") + " output"}
+        finally:
+            with lock:
+                finished_count += 1
+                if finished_count == 3:
+                    finished.set()
+
+    transport = httpx.ASGITransport(app=main.app, raise_app_exceptions=False)
+    with patch.object(main.capture, "read_image", side_effect=read_one), \
+            patch.object(main.extract, "screen_document", return_value={"clinical": True, "kind": "offline record"}), \
+            patch("sys.stderr", io.StringIO()):
+        async with httpx.AsyncClient(transport=transport, base_url="http://offline") as client:
+            request = asyncio.create_task(client.post("/capture", files=[
+                ("documents", ("first.png", b"first", "image/png")),
+                ("documents", ("broken.png", b"broken", "image/png")),
+                ("documents", ("last.png", b"last", "image/png")),
+            ]))
+            try:
+                await asyncio.wait_for(failure_seen.wait(), timeout=5)
+                done, _ = await asyncio.wait({request}, timeout=0.05)
+                waits_for_all = not done
+                files_live = len(paths) == 3 and all(path.exists() for path in paths)
+            finally:
+                release.set()
+            response = await asyncio.wait_for(request, timeout=5)
+            await asyncio.to_thread(finished.wait, 5)
+    try:
+        mixed = response.json()
+    except ValueError:
+        mixed = {}
+    check("a mixed document batch returns HTTP 200", response.status_code == 200, response.text[:200])
+    rows = mixed.get("scanned_documents", [])
+    check("all document results retain their upload order",
+          [row["name"] for row in rows] == ["first.png", "broken.png", "last.png"])
+    check("successful documents survive a sibling OCR failure",
+          len(rows) == 3 and rows[0].get("text") == "first output"
+          and rows[2].get("text") == "last output" and rows[0].get("clinical") is True)
+    check("an unreadable document is an error entry with no usable text",
+          len(rows) == 3 and rows[1].get("status") == "error" and rows[1].get("clinical") is False
+          and rows[1].get("chars") == 0 and rows[1].get("text") == ""
+          and 0 < len(rows[1].get("error", "")) <= 200)
+    check("a failed scan does not finish the request while sibling scans are pending", waits_for_all)
+    check("all temporary files remain available until the other scans finish", files_live)
+    check("temporary files are removed after the complete batch", bool(paths) and all(not path.exists() for path in paths))
+
+    with patch.object(main.capture, "read_image", side_effect=TimeoutError("offline timeout")), \
+            patch("sys.stderr", io.StringIO()):
+        async with httpx.AsyncClient(transport=transport, base_url="http://offline") as client:
+            response = await client.post("/capture", files=[
+                ("documents", ("one.png", b"one", "image/png")),
+                ("documents", ("two.png", b"two", "image/png")),
+            ])
+            all_failed = response.json()
+            malformed = await client.post("/capture", files=[("documents", (None, "not a file"))])
+            wrong_type = await client.post("/capture", json={"documents": []})
+    errors = all_failed.get("scanned_documents", [])
+    check("an entirely unreadable batch still returns HTTP 200 with every error",
+          response.status_code == 200 and len(errors) == 2
+          and all(row.get("status") == "error" and row.get("clinical") is False for row in errors))
+    check("a malformed multipart document entry remains a request-level error", malformed.status_code == 502)
+    check("the existing non-multipart validation is unchanged", wrong_type.status_code == 400)
+
+    cancellation_started = asyncio.Event()
+    cancellation_release = threading.Event()
+    cancellation_paths = []
+
+    def read_until_released(path):
+        with lock:
+            cancellation_paths.append(Path(path))
+            if len(cancellation_paths) == 2:
+                loop.call_soon_threadsafe(cancellation_started.set)
+        if not cancellation_release.wait(timeout=5):
+            raise RuntimeError("offline cancellation scan was not released")
+        return {"text": Path(path).read_text(encoding="utf-8")}
+
+    with patch.object(main.capture, "read_image", side_effect=read_until_released), \
+            patch.object(main.extract, "screen_document", return_value={"clinical": True, "kind": "offline record"}), \
+            patch("sys.stderr", io.StringIO()):
+        async with httpx.AsyncClient(transport=transport, base_url="http://offline") as client:
+            request = asyncio.create_task(client.post("/capture", files=[
+                ("documents", ("one.png", b"one", "image/png")),
+                ("documents", ("two.png", b"two", "image/png")),
+            ]))
+            try:
+                await asyncio.wait_for(cancellation_started.wait(), timeout=5)
+                request.cancel()
+                done, _ = await asyncio.wait({request}, timeout=0.05)
+                cancel_waits = not done and all(path.exists() for path in cancellation_paths)
+            finally:
+                cancellation_release.set()
+            cancelled = False
+            try:
+                await asyncio.wait_for(request, timeout=5)
+            except asyncio.CancelledError:
+                cancelled = True
+    check("request cancellation waits for scans before removing their files", cancel_waits)
+    check("request cancellation still propagates after scans finish", cancelled)
+    check("cancelled requests clean up files after every worker finishes",
+          len(cancellation_paths) == 2 and all(not path.exists() for path in cancellation_paths))
+    return mixed, all_failed
+
+
+mixed_documents, failed_documents = asyncio.run(exercise_document_batches())
+
+
+# ===========================================================================
+section("failed document rows are visible but never become analysis evidence")
+try:
+    browser_result = browser_checks(r"""
+let rows=[];
+const docs=document.getElementById('docs');
+Object.defineProperty(docs,'innerHTML',{set(){rows=[];},get(){return '';}});
+docs.appendChild=row=>rows.push(row);
+document.createElement=()=>{
+  const row=element(), thumb=element(), toggle=element();
+  row.querySelector=selector=>selector==='.thumb' ? thumb
+    : selector==='button[data-doc]' && /<button[^>]*data-doc=/.test(row.innerHTML) ? toggle : null;
+  return row;
+};
+context.FormData=class {append(){}};
+context.scanResponse=MIXED_DOCUMENTS;
+const analysisBodies=[];
+context.fetch=async(url,options)=>{
+  if(url==='/capture')return {ok:true,json:async()=>context.scanResponse};
+  if(url==='/analyze'){
+    analysisBodies.push(JSON.parse(options.body));
+    return {ok:true,json:async()=>({abstaining:true,message:'Offline test',cant_miss:[],
+      differential:[],unrated:[],ruled_out:[],doesnt_fit:[],next_question:null})};
+  }
+  throw new Error('Unexpected offline request');
+};
+run(`reset();committed=true;docFiles=[{name:'first.png'},{name:'broken.png'},{name:'last.png'}];`);
+await run('docSend()');
+results.mixed_summary=document.getElementById('doc-result').textContent.includes('2 scanned, 1 could not be read')
+  && document.getElementById('docn').textContent.includes('2 scanned, 1 could not be read');
+results.error_visible=rows.length===3 && rows[1].innerHTML.toLowerCase().includes('could not be read')
+  && rows[1].innerHTML.includes('broken.png')
+  && rows[1].innerHTML.includes(context.scanResponse.scanned_documents[1].error)
+  && !rows[1].querySelector('button[data-doc]');
+results.failed_excluded=run(`scannedDocs.length===3 && scannedDocs[1].use===false
+  && docText()==='first output\\n\\nlast output'`);
+if(run('scannedDocs.length===3')){
+  run(`scannedDocs[1].use=true;scannedDocs[1].text='DO_NOT_ANALYZE';`);
+  await run('runAnalyze()');
+  results.analysis_only_success=analysisBodies.length===1
+    && analysisBodies[0].doc_text==='first output\n\nlast output';
+  run(`scannedDocs[1].error='<img src=x onerror=bad()> could not be read';renderScannedDocs();`);
+  results.escaped_error=rows[1].innerHTML.includes('&lt;img') && !rows[1].innerHTML.includes('<img');
+}
+context.scanResponse=FAILED_DOCUMENTS;
+run(`reset();docFiles=[{name:'one.png'},{name:'two.png'}];`);await run('docSend()');
+results.all_failed=run('scannedDocs.length===2 && scannedDocs.every(d=>!d.use) && docText()===\'\' && !hasLiveInput')
+  && document.getElementById('doc-result').textContent.includes('0 scanned, 2 could not be read');
+""".replace("MIXED_DOCUMENTS", json.dumps(mixed_documents)).replace("FAILED_DOCUMENTS", json.dumps(failed_documents)))
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+for key, description in [
+    ("mixed_summary", "a mixed batch displays scanned and unreadable document counts"),
+    ("error_visible", "an unreadable row shows its filename and error chip without an include control"),
+    ("failed_excluded", "failed documents start excluded from document text"),
+    ("analysis_only_success", "the actual analysis request receives only successful document text"),
+    ("escaped_error", "document error messages cannot insert HTML"),
+    ("all_failed", "an all-error batch stays visible without opening the clinical reveal gate"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
 
 
 # ===========================================================================

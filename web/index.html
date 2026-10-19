@@ -690,7 +690,7 @@ let liveTranscriptExtra='';
 // real consultation changed the candidate list.
 let scannedDocs=[];
 function docText(){
-  return scannedDocs.filter(d=>d.use).map(d=>d.text).join('\n\n');
+  return scannedDocs.filter(d=>d.use && d.status!=='error').map(d=>d.text).join('\n\n');
 }
 let analyzeTimer=null, analyzeInFlight=false, analyzeQueued=false;
 let analysisRequestId=0;
@@ -1109,6 +1109,8 @@ function renderScannedDocs(){
   scannedDocs.forEach((d,i)=>{
     const el=document.createElement('div');
     el.className='doc';
+    const failed=d.status==='error';
+    if(failed)d.use=false;
     // A document the screen did not recognise as clinical is NOT deleted and
     // its text is NOT thrown away. It is set aside, labelled with what the
     // screen thought it was, and one click puts it back — because wrongly
@@ -1116,16 +1118,18 @@ function renderScannedDocs(){
     // know was missing, which is the same shape as removing a warning.
     el.innerHTML=`<div class="thumb clickable${d.use?'':' off'}" title="Click to view extracted text"></div><div class="docmeta">
       <div class="t">${escHtml(d.name)}</div>
-      ${d.clinical
+      ${failed
+        ? `<span class="chip warn">COULD NOT BE READ</span><div class="docuse">${escHtml(d.error||'Could not read document. Try scanning it again.')}</div>`
+        : d.clinical
         ? `<span class="chip"><span class="k">OCR</span> ${d.chars} chars extracted</span>
            ${d.kind?`<span class="chip"><span class="k">READS AS</span> ${escHtml(d.kind)}</span>`:''}`
         : `<span class="chip warn"><span class="k">NOT A CLINICAL DOCUMENT</span> ${escHtml(d.kind||'unrecognised')}</span>`}
-      <div class="docuse">${d.use
+      ${failed?'':`<div class="docuse">${d.use
            ? (d.clinical ? 'Included in the analysis.' : 'Included in the analysis anyway.')
            : 'Set aside — its text is not being used.'}
-         <button type="button" data-doc="${i}">${d.use?'Set aside':(d.clinical?'Use document':'Use it anyway')}</button></div>
+         <button type="button" data-doc="${i}">${d.use?'Set aside':(d.clinical?'Use document':'Use it anyway')}</button></div>`}
     </div>`;
-    el.querySelector('.thumb').onclick = () => openDocModal(d.name, d.text);
+    el.querySelector('.thumb').onclick = () => openDocModal(d.name, failed?d.error:d.text);
     const toggle=el.querySelector('button[data-doc]');
     if(toggle) toggle.onclick=()=>{
       scannedDocs[i].use=!scannedDocs[i].use;
@@ -1134,10 +1138,12 @@ function renderScannedDocs(){
     };
     $('docs').appendChild(el);
   });
-  const used=scannedDocs.filter(d=>d.use).length;
-  $('docn').textContent = used===scannedDocs.length
-    ? scannedDocs.length+' scanned'
-    : used+' of '+scannedDocs.length+' used';
+  const readable=scannedDocs.filter(d=>d.status!=='error');
+  const used=readable.filter(d=>d.use).length;
+  const failed=scannedDocs.length-readable.length;
+  $('docn').textContent = (used===readable.length
+    ? readable.length+' scanned'
+    : used+' of '+readable.length+' used')+(failed?`, ${failed} could not be read`:'');
 }
 
 async function docSend(){
@@ -1162,15 +1168,19 @@ async function docSend(){
     // Default: use it if the screen called it clinical. Never the reverse —
     // nothing is silently discarded, it is only set aside where the
     // clinician can see it and put it back with one click.
-    incoming.forEach(d=>scannedDocs.push(Object.assign({}, d, {use: d.clinical !== false})));
+    incoming.forEach(d=>scannedDocs.push(Object.assign({}, d, {use: d.status!=='error' && d.clinical !== false})));
     renderScannedDocs();
-    if(incoming.length){
+    const readable=incoming.filter(d=>d.status!=='error');
+    if(readable.length){
       svc('s-vis',1);
       hasLiveInput=true; paintDX(); paintCM();
       scheduleAnalyze();
     }
-    const rejected=incoming.filter(d=>d.clinical===false);
-    $('doc-result').textContent = rejected.length
+    const rejected=readable.filter(d=>d.clinical===false);
+    const failed=incoming.length-readable.length;
+    $('doc-result').textContent = failed
+      ? `${readable.length} scanned, ${failed} could not be read`+(rejected.length?`; ${rejected.length} set aside as non-clinical.`:'.')
+      : rejected.length
       ? (rejected.length===incoming.length
           ? 'Scanned — this does not look like a clinical document, so it is not being used.'
           : rejected.length+' of '+incoming.length+' do not look clinical and are not being used.')
