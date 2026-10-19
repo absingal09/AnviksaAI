@@ -576,6 +576,35 @@ check("exhausted tool-call retries remain an error rather than an empty clinical
 # ===========================================================================
 section("model output validation")
 # All nonempty extraction/screening responses are mocked: never call a model.
+
+# This checks the request contract, not whether a live model obeys the prompt.
+# The live failure returned no findings for supplied sample records while the
+# transcript was empty, despite OCR and screening both succeeding.
+sample_document = (
+    "Desogestrel 0.15 mg and Ethinylestradiol 0.03 mg Tablets IP\n"
+    "SAMPLE - SYNTHETIC DOCUMENT FOR APP TESTING ONLY"
+)
+sample_quote = "Desogestrel 0.15 mg and Ethinylestradiol 0.03 mg Tablets IP"
+with patch.object(llm, "cached", side_effect=lambda path, produce: produce()), \
+        patch.object(llm, "call_tool", return_value={
+            "present": [{"id": "on_oral_contraceptive", "evidence": sample_quote}],
+            "absent": [],
+        }) as sample_call:
+    sample_findings, sample_quotes = extract.extract("", sample_document)
+sample_system, sample_input, sample_tool = sample_call.call_args.args
+check("document-only extraction sends the supplied record to the extraction model",
+      sample_call.call_count == 1 and sample_document in sample_input
+      and "TRANSCRIPT:\n\n\nDOCUMENTS" in sample_input
+      and sample_tool == extract._TOOL and sample_call.call_args.kwargs == {"task": "extract"})
+check("extraction abstains only when both transcript and documents lack clinical content",
+      "If neither the transcript nor the supplied documents contains clinical content" in sample_system
+      and "If the transcript contains no clinical content at all, record nothing" not in sample_system)
+check("extraction explicitly retains evidence in sample records without relaxing quotation requirements",
+      "sample or synthetic labels do not erase the clinical facts" in sample_system
+      and "using the same evidence requirements" in sample_system
+      and sample_findings == {"on_oral_contraceptive": True}
+      and sample_quotes == {"on_oral_contraceptive": sample_quote})
+
 def extracted_response(response):
     with patch.object(extract.llm, "cached", return_value=response):
         try:

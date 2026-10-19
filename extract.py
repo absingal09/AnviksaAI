@@ -89,8 +89,14 @@ examination findings from symptoms.
 - If two findings are opposites and the patient described one, you may mark \
 the other absent — sudden onset described means gradual onset absent. Only \
 do this when the transcript genuinely settles it.
-- If the transcript contains no clinical content at all, record nothing. An \
-empty result is a correct and expected answer."""
+- If neither the transcript nor the supplied documents contains clinical content, \
+record nothing. An empty result is a correct and expected answer.
+
+For engineering test inputs, sample or synthetic labels do not erase the clinical facts \
+explicitly written in the supplied records. Extract those facts for the test patient \
+using the same evidence requirements. A blank transcript does not mean the DOCUMENTS \
+section is blank. Do not infer additional symptoms or diagnoses.
+"""
 
 _TOOL = {
     "type": "function",
