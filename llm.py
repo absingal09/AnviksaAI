@@ -119,6 +119,11 @@ def call_tool(system_prompt, user_content, tool, *, max_tokens=4096, max_retries
                 ],
                 tools=[tool],
                 tool_choice={"type": "function", "function": {"name": tool["function"]["name"]}},
+                # Sarvam defaults to thinking mode, whose tokens share this
+                # output budget. It can exhaust the budget (especially the
+                # short document screen) before emitting any tool arguments.
+                # Send explicit null: omitting the field enables thinking.
+                reasoning_effort=None,
                 temperature=0.0,
                 # The seed moves ONLY on retry. Observed live: with
                 # temperature=0 and a fixed seed, a ToolCallMissing response

@@ -31,10 +31,12 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import yaml
 
 import engine
 import extract
+import llm
 import propose
 import vocabulary
 
@@ -498,6 +500,62 @@ try:
 except Exception as e:
     ok, bogus = False, str(e)
 check("a malformed candidate renders instead of crashing the panel", ok, str(bogus))
+
+
+# ===========================================================================
+section("structured chat returns data instead of spending the output budget thinking")
+
+
+def offline_chat(reply):
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        message, finish_reason = reply(body, len(requests))
+        return httpx.Response(200, json={
+            "id": "offline-chat", "created": 0, "model": llm.MODEL,
+            "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
+        sdk = llm.SarvamAI(api_subscription_key="offline-test-key", httpx_client=transport)
+        with patch.object(llm, "client", return_value=sdk), patch.object(llm.time, "sleep"):
+            try:
+                result = llm.call_tool("offline system", "offline input", extract._SCREEN_TOOL, max_tokens=256)
+                error = None
+            except Exception as exc:
+                result, error = None, exc
+    return result, requests, error
+
+
+screen_arguments = {"clinical": True, "kind": "offline document"}
+screen_reply = {"role": "assistant", "tool_calls": [{
+    "id": "offline-tool", "type": "function", "function": {
+        "name": "screen_document", "arguments": json.dumps(screen_arguments),
+    },
+}]}
+missing_reply = {"role": "assistant", "content": None, "reasoning_content": "offline thinking"}
+
+result, chat_requests, error = offline_chat(lambda body, attempt:
+    (screen_reply, "tool_calls") if "reasoning_effort" in body and body["reasoning_effort"] is None
+    else (missing_reply, "length"))
+check("the SDK explicitly sends null reasoning_effort to disable hidden thinking",
+      bool(chat_requests) and all("reasoning_effort" in r and r["reasoning_effort"] is None for r in chat_requests))
+check("a short structured screening response succeeds without consuming retries",
+      not error and result == screen_arguments and len(chat_requests) == 1, str(error))
+
+result, chat_requests, error = offline_chat(lambda body, attempt:
+    (missing_reply, "length") if attempt == 1 else (screen_reply, "tool_calls"))
+check("missing tool calls still retry with a changed seed and the original forced schema",
+      not error and result == screen_arguments and [r["seed"] for r in chat_requests] == [0, 1]
+      and all(r["temperature"] == 0 and r["max_tokens"] == 256
+              and r["tools"] == [extract._SCREEN_TOOL]
+              and r["tool_choice"] == {"type": "function", "function": {"name": "screen_document"}}
+              for r in chat_requests), str(error))
+result, chat_requests, error = offline_chat(lambda body, attempt: (missing_reply, "length"))
+check("exhausted tool-call retries remain an error rather than an empty clinical result",
+      isinstance(error, llm.ToolCallMissing) and result is None and len(chat_requests) == 2)
 
 
 # ===========================================================================
