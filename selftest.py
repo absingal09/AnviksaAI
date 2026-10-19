@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -80,15 +81,22 @@ function element() {
   return {
     innerHTML:'', textContent:'', value:'', disabled:false, style:{}, dataset:{},
     parentElement:{scrollTop:0}, appendChild(){}, addEventListener(){},
+    contains(target){return target===this;},
+    getBoundingClientRect(){return {left:100,top:200,right:400,bottom:500,width:300,height:300};},
     querySelector(){return null;}, querySelectorAll(){return [];},
     classList:{add(c){classes.add(c);}, remove(c){classes.delete(c);},
       contains(c){return classes.has(c);},
       toggle(c,on){if(on===undefined)on=!classes.has(c);if(on)classes.add(c);else classes.delete(c);}}
   };
 }
+const documentListeners = new Map();
 const document = {
   getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id);},
-  createElement:element, addEventListener(){}
+  createElement:element,
+  addEventListener(type, handler, capture=false){
+    if(!documentListeners.has(type))documentListeners.set(type,[]);
+    documentListeners.get(type).push({handler,capture});
+  }
 };
 const context = vm.createContext({document,console,AbortController,
   setTimeout(){return 1;},clearTimeout(){},
@@ -682,6 +690,201 @@ except Exception as exc:
     browser_result, browser_error = {}, str(exc)
 check("patient name cannot insert HTML into the header", browser_result.get("escaped_name", False), browser_error)
 check("case ID cannot insert HTML into the header", browser_result.get("escaped_case_id", False), browser_error)
+
+
+# ===========================================================================
+section("documents can be selected by dropping files or using the picker")
+class DropAreaMarkup(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.stack, self.parents = [], {}
+
+    def handle_starttag(self, tag, attrs):
+        identifier = dict(attrs).get("id")
+        if identifier:
+            self.parents[identifier] = tuple(item[1] for item in self.stack)
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            self.stack.append((tag, identifier))
+
+    def handle_endtag(self, tag):
+        while self.stack:
+            if self.stack.pop()[0] == tag:
+                break
+
+
+drop_markup = DropAreaMarkup()
+drop_markup.feed((ROOT / "web" / "index.html").read_text(encoding="utf-8"))
+check("the drop target contains the records heading, document list and file controls",
+      all("doc-drop" in drop_markup.parents.get(identifier, ())
+          for identifier in ("docn", "docs", "doc-files", "doc-send", "doc-selected", "doc-result")))
+try:
+    browser_result = browser_checks(r"""
+const drop=document.getElementById('doc-drop'), picker=document.getElementById('doc-files');
+const image={name:'<b>scan</b>.png',type:'image/png'}, pdf={name:'report.PDF',type:''};
+const unsupported={name:'notes.exe',type:'application/octet-stream'};
+let prevented=0, fetches=0;
+function event(files=[]){return {target:drop,clientX:150,clientY:250,preventDefault(){prevented++;},dataTransfer:{files,types:['Files'],dropEffect:''}};}
+drop.ondragenter(event());drop.ondragenter(event());drop.ondragleave({...event(),relatedTarget:drop});
+results.nested_highlight=drop.classList.contains('dragging');
+drop.ondragleave(event());
+results.highlight_clears=!drop.classList.contains('dragging');
+const over=event();drop.ondragover(over);
+drop.ondrop(event([image,pdf]));
+results.multiple_drop=run('docFiles.length===2') && !elements.get('doc-send').disabled
+  && document.getElementById('doc-selected').textContent.includes('<b>scan</b>.png')
+  && document.getElementById('doc-selected').innerHTML==='';
+results.prevent_navigation=prevented===6 && over.dataTransfer.dropEffect==='copy'
+  && !drop.classList.contains('dragging');
+const additional={name:'another-report.pdf',type:'application/pdf',size:123,lastModified:42};
+drop.ondrop(event([additional]));
+results.repeated_drops_add=run('docFiles.length===3')
+  && document.getElementById('doc-selected').textContent.includes('another-report.pdf')
+  && document.getElementById('doc-selected').textContent.includes('report.PDF');
+drop.ondrop(event([additional,image]));
+results.duplicate_drops_skip=run('docFiles.length===3');
+run('clearDocSelection()');
+drop.ondrop(event([image,unsupported]));
+results.mixed_types=run('docFiles.length===1 && docFiles[0].name.includes("scan")')
+  && document.getElementById('doc-selected').textContent.includes('Unsupported files skipped: notes.exe');
+drop.ondrop(event([unsupported]));
+results.unsupported_preserves=run('docFiles.length===1') && !elements.get('doc-send').disabled;
+run('clearDocSelection()');drop.ondrop(event([unsupported]));
+results.unsupported_disabled=run('docFiles.length===0') && elements.get('doc-send').disabled;
+picker.files=[pdf];picker.onchange();
+drop.ondrop(event());
+results.picker_and_empty_drop=run(`docFiles.length===1 && docFiles[0].name==='report.PDF'`)
+  && document.getElementById('doc-selected').textContent.includes('report.PDF');
+
+let finishUpload, sentFiles=[];
+context.FormData=class {append(key,file,name){sentFiles.push({key,name});}};
+context.fetch=()=>{fetches++;return new Promise(resolve=>{finishUpload=resolve;});};
+const upload=run('docSend()');
+results.upload_busy=picker.disabled && drop.classList.contains('busy');
+drop.ondrop(event([image]));await run('docSend()');
+results.pending_upload_protected=fetches===1 && sentFiles.length===1 && sentFiles[0].name==='report.PDF'
+  && run(`docFiles.length===1 && docFiles[0].name==='report.PDF'`);
+finishUpload({ok:true,json:async()=>({scanned_documents:[]})});await upload;
+results.upload_cleanup=!picker.disabled && !drop.classList.contains('busy')
+  && run('docFiles.length===0') && elements.get('doc-send').disabled
+  && document.getElementById('doc-selected').textContent==='';
+picker.files=[image];picker.onchange();drop.ondragenter(event());run('reset()');
+results.reset_cleanup=run('docFiles.length===0') && picker.value===''
+  && !drop.classList.contains('dragging') && elements.get('doc-send').disabled
+  && document.getElementById('doc-selected').textContent==='';
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+for key, description in [
+    ("nested_highlight", "dragging over children keeps the drop area highlighted"),
+    ("highlight_clears", "leaving the drop area clears its highlight"),
+    ("multiple_drop", "dropping multiple images and PDFs selects them and renders filenames as text"),
+    ("prevent_navigation", "dropping files prevents browser navigation and advertises copying"),
+    ("repeated_drops_add", "successive drops accumulate files before scanning"),
+    ("duplicate_drops_skip", "dropping the same file again does not duplicate its upload"),
+    ("mixed_types", "supported dropped files survive alongside a visible unsupported-file message"),
+    ("unsupported_preserves", "an unsupported drop does not discard already selected files"),
+    ("unsupported_disabled", "unsupported files cannot enable scanning"),
+    ("picker_and_empty_drop", "the file picker shares selection and text-only drops do not erase it"),
+    ("upload_busy", "uploading temporarily disables the file picker and marks the drop area busy"),
+    ("pending_upload_protected", "drops and duplicate scans cannot replace or resend an active upload"),
+    ("upload_cleanup", "finishing an upload clears the selection and restores upload controls"),
+    ("reset_cleanup", "reset clears pending files and drag feedback"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
+
+
+# ===========================================================================
+section("file drops are intercepted before nested controls and cannot navigate")
+try:
+    browser_result = browser_checks(r"""
+const drop=document.getElementById('doc-drop');
+const child={id:'nested-control'}, outside={id:'outside'};
+drop.contains=target=>target===drop || target===child;
+const image={name:'scan.png',type:'image/png'};
+function fileEvent(target,files=[],types=['Files']){
+  return {target,clientX:150,clientY:250,defaultPrevented:false,preventDefault(){this.defaultPrevented=true;},
+    dataTransfer:{files,types,dropEffect:''}};
+}
+function capture(type,event){
+  for(const listener of documentListeners.get(type)||[]){
+    if(listener.capture===true)listener.handler(event);
+  }
+}
+const over=fileEvent(child);
+capture('dragover',over);
+results.capture_over=over.defaultPrevented && over.dataTransfer.dropEffect==='copy';
+const inside=fileEvent(child,[image]);
+capture('drop',inside);
+results.capture_drop=inside.defaultPrevented && run(`docFiles.length===1 && docFiles[0].name==='scan.png'`)
+  && !elements.get('doc-send').disabled;
+const status=document.getElementById('doc-result');
+status.textContent='Existing scan status';status.style.display='none';
+const elsewhere=fileEvent(outside,[image]);
+capture('dragover',elsewhere);capture('drop',elsewhere);
+results.no_navigation_outside=elsewhere.defaultPrevented && elsewhere.dataTransfer.dropEffect==='none'
+  && status.textContent==='Existing scan status' && status.style.display==='none';
+let rejectedEverywhere=true;
+for(const id of ['tx','dnote-input','cm','dx','qbody','mis','live-rec','patientbar','setupForm','doc-modal-body']){
+  const target=document.getElementById(id);
+  const event=fileEvent(target,[{name:id+'.pdf',type:'application/pdf'}]);
+  capture('dragover',event);capture('drop',event);
+  rejectedEverywhere=rejectedEverywhere && event.defaultPrevented
+    && event.dataTransfer.dropEffect==='none'
+    && run(`docFiles.length===1 && docFiles[0].name==='scan.png'`)
+    && status.textContent==='Existing scan status';
+}
+results.strict_panel_boundary=rejectedEverywhere;
+const directOutside=fileEvent(outside,[{name:'outside.pdf',type:'application/pdf'}]);
+context.outsideDrop=directOutside;run('acceptDocDrop(outsideDrop)');
+results.shared_handler_rejects_outside=run(`docFiles.length===1 && docFiles[0].name==='scan.png'`);
+drop.classList.add('dragging');
+const outsideHover=fileEvent(outside);
+outsideHover.clientY=600;capture('dragover',outsideHover);
+results.outside_hover_clears=!drop.classList.contains('dragging') && outsideHover.dataTransfer.dropEffect==='none';
+let geometryRejected=true;
+for(const [x,y] of [[99,250],[400,250],[150,199],[150,500]]){
+  const stale=fileEvent(child,[{name:'outside-bounds.pdf',type:'application/pdf'}]);
+  stale.clientX=x;stale.clientY=y;
+  drop.classList.add('dragging');
+  capture('dragover',stale);capture('drop',stale);
+  geometryRejected=geometryRejected && stale.dataTransfer.dropEffect==='none'
+    && !drop.classList.contains('dragging')
+    && run(`docFiles.length===1 && docFiles[0].name==='scan.png'`);
+}
+results.geometry_rejected=geometryRejected;
+capture('dragover',fileEvent(child));
+results.reentry_highlights=drop.classList.contains('dragging');
+drop.classList.add('dragging');
+capture('dragend',fileEvent(child));
+results.cancel_clears=!drop.classList.contains('dragging');
+const text=fileEvent(child,[],['text/plain']);
+context.testImage=image;run('selectDocFiles([testImage])');
+capture('dragover',text);capture('drop',text);
+results.text_untouched=!text.defaultPrevented && run('docFiles.length===1');
+run('docScanInFlight=true');
+const busy=fileEvent(child,[{name:'replacement.pdf',type:'application/pdf'}]);
+capture('dragover',busy);capture('drop',busy);
+results.busy_protected=busy.defaultPrevented && busy.dataTransfer.dropEffect==='none'
+  && run(`docFiles.length===1 && docFiles[0].name==='scan.png'`);
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+for key, description in [
+    ("capture_over", "file dragover is accepted before nested control handlers"),
+    ("capture_drop", "a file drop selects documents even if a child stops bubbling"),
+    ("no_navigation_outside", "outside file drops are ignored without navigation or UI changes"),
+    ("strict_panel_boundary", "every other consultation section rejects document drops"),
+    ("shared_handler_rejects_outside", "the shared selection handler itself rejects outside drops"),
+    ("outside_hover_clears", "moving over another section immediately clears the records highlight"),
+    ("geometry_rejected", "all four visible panel boundaries reject outside pointer coordinates"),
+    ("reentry_highlights", "returning inside the visible records bounds restores the highlight"),
+    ("cancel_clears", "ending a drag clears the drop highlight"),
+    ("text_untouched", "the file navigation guard leaves text drags alone"),
+    ("busy_protected", "early file-drop handling cannot replace an active upload"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
 
 
 # ===========================================================================
