@@ -622,6 +622,60 @@ check("case ID cannot insert HTML into the header", browser_result.get("escaped_
 
 
 # ===========================================================================
+section("scanned documents can be set aside and restored")
+try:
+    browser_result = browser_checks(r"""
+let rows=[];
+const docs=document.getElementById('docs');
+Object.defineProperty(docs,'innerHTML',{set(){rows=[];},get(){return '';}});
+docs.appendChild=row=>rows.push(row);
+document.createElement=()=>{
+  const row=element(), thumb=element(), toggle=element();
+  row.querySelector=selector=>selector==='.thumb' ? thumb
+    : selector==='button[data-doc]' && /<button[^>]*data-doc=/.test(row.innerHTML) ? toggle : null;
+  return row;
+};
+let scheduled=0;
+context.setTimeout=()=>{scheduled++;return scheduled;};
+run(`liveTranscriptExtra='recorded consultation';scannedDocs=[
+  {name:'clinical.txt',text:'first document text',chars:19,clinical:true,kind:'clinical record',use:true},
+  {name:'other.txt',text:'other document text',chars:19,clinical:true,kind:'clinical record',use:true},
+  {name:'rejected.txt',text:'retained rejected text',chars:22,clinical:false,kind:'screenshot',use:false}
+];renderScannedDocs();`);
+const original=run('JSON.stringify(scannedDocs[0])');
+const aside=rows[0].querySelector('button[data-doc]');
+results.clinical_control=!!aside && rows[0].innerHTML.includes('Set aside');
+if(aside){
+  aside.onclick();
+  results.excludes_selected=run(`!scannedDocs[0].use && docText()==='other document text'
+    && liveTranscriptExtra==='recorded consultation'`) && elements.get('docn').textContent==='1 of 3 used';
+  results.schedules_analysis=scheduled===1;
+  rows[0].querySelector('.thumb').onclick();
+  results.retains_text=elements.get('doc-modal-body').textContent==='first document text';
+  const restore=rows[0].querySelector('button[data-doc]');
+  if(restore)restore.onclick();
+  results.restores_document=run('JSON.stringify(scannedDocs[0])')===original
+    && run(`docText()==='first document text\\n\\nother document text'`) && scheduled===2;
+}
+const rejected=rows[2].querySelector('button[data-doc]');
+if(rejected)rejected.onclick();
+results.restores_rejected=run(`scannedDocs[2].use && docText().includes('retained rejected text')`);
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+for key, description in [
+    ("clinical_control", "included clinical documents expose a Set aside control"),
+    ("excludes_selected", "setting aside removes only that document from analysis"),
+    ("schedules_analysis", "setting aside schedules analysis with the updated evidence"),
+    ("retains_text", "a set-aside document's extracted text remains readable"),
+    ("restores_document", "restoring a clinical document preserves its text and screening metadata"),
+    ("restores_rejected", "a screened-out document can still be included manually"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
+
+
+# ===========================================================================
 section("analysis results follow the current consultation and evidence")
 try:
     browser_result = browser_checks(r"""

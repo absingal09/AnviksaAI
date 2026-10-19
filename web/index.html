@@ -1035,11 +1035,10 @@ function renderScannedDocs(){
         ? `<span class="chip"><span class="k">OCR</span> ${d.chars} chars extracted</span>
            ${d.kind?`<span class="chip"><span class="k">READS AS</span> ${escHtml(d.kind)}</span>`:''}`
         : `<span class="chip warn"><span class="k">NOT A CLINICAL DOCUMENT</span> ${escHtml(d.kind||'unrecognised')}</span>`}
-      ${d.clinical && d.use ? '' :
-        `<div class="docuse">${d.use
-           ? 'Included in the analysis anyway.'
+      <div class="docuse">${d.use
+           ? (d.clinical ? 'Included in the analysis.' : 'Included in the analysis anyway.')
            : 'Set aside — its text is not being used.'}
-         <button type="button" data-doc="${i}">${d.use?'Set aside':'Use it anyway'}</button></div>`}
+         <button type="button" data-doc="${i}">${d.use?'Set aside':(d.clinical?'Use document':'Use it anyway')}</button></div>
     </div>`;
     el.querySelector('.thumb').onclick = () => openDocModal(d.name, d.text);
     const toggle=el.querySelector('button[data-doc]');
