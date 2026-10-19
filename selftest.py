@@ -443,21 +443,26 @@ check("candidate order from propose.py does not change the panel", a == c)
 
 
 # ===========================================================================
-section("the canonical case is expressible")
+section("the case fixtures are expressible")
 # ===========================================================================
 # Without this, nothing defines what correct output looks like and there is
 # nothing for a regression to be measured against.
-case = yaml.safe_load((ROOT / "canonical_case.yaml").read_text(encoding="utf-8"))
-ef = case["expected_findings"]
-refs = ef["present"] + ef["absent"] + ef["must_be_unknown"] + case["expectations"]["next_question_in"]
-unknown_refs = sorted(f for f in refs if f not in vocabulary.FINDINGS)
-check("every finding the canonical case names exists in the vocabulary",
-      not unknown_refs, str(unknown_refs))
-check("pulmonary embolism is rated at the top severity band",
-      eng.band("Pulmonary embolism")[0] == "critical")
-check("pulmonary embolism can be excluded", len(eng.exclusion_options("Pulmonary embolism")) > 0)
-check("the doctor's own working diagnosis is rated, not unrated",
-      eng.band("Panic attack")[0] != "unrated")
+case_paths = sorted(p for p in (ROOT / "cases").glob("*.yaml") if not p.name.startswith("_"))
+if not case_paths:
+    raise RuntimeError("No case fixtures found in cases/ (underscore-prefixed files are skipped)")
+for case_path in case_paths:
+    case = yaml.safe_load(case_path.read_text(encoding="utf-8"))
+    print(f"  case: {case['case']['id']}")
+    ef = case["expected_findings"]
+    refs = ef["present"] + ef["absent"] + ef["must_be_unknown"] + case["expectations"]["next_question_in"]
+    unknown_refs = sorted(f for f in refs if f not in vocabulary.FINDINGS)
+    check("every finding the case names exists in the vocabulary",
+          not unknown_refs, str(unknown_refs))
+    check("pulmonary embolism is rated at the top severity band",
+          eng.band("Pulmonary embolism")[0] == "critical")
+    check("pulmonary embolism can be excluded", len(eng.exclusion_options("Pulmonary embolism")) > 0)
+    check("the doctor's own working diagnosis is rated, not unrated",
+          eng.band("Panic attack")[0] != "unrated")
 
 
 # ===========================================================================

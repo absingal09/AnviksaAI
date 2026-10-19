@@ -96,13 +96,31 @@ matching, readable reasoning, unrated candidates, absence of numeric scores,
 three-valued/empty-input behavior, no repeated questions, human-confirmed
 exclusion, and deterministic triage. Run it for changes to these behaviors.
 
-`canonical_case.yaml` defines the key clinical regression scenario. Offline
-tests check its vocabulary and rulebook properties; they do not run an end-to-end
-model evaluation or establish diagnostic accuracy. Live verification is a
-separate exercise with real API calls. For UI changes, also check the reveal
-gate, state across updates, document restoration, and displayed spoken text in
-the browser. No separate test runner, linter, formatter, or frontend build
-configuration is checked in.
+`cases/` contains clinical regression fixtures. `selftest.py` loops over every
+`*.yaml` file there except underscore-prefixed files, checking vocabulary and
+rulebook properties offline. The original PE fixture is unchanged at
+`cases/pe_masquerading_as_panic.yaml`; with this one case all 94 existing checks
+still run. `.github/workflows/selftest.yml` runs the suite on every push and pull
+request with Python 3.12, installing `requirements.txt` and needing no API key.
+
+Live checks are separate and manual, requiring `SARVAM_API_KEY`:
+
+```sh
+python run_cases.py
+python run_cases.py pe_masquerading_as_panic
+```
+
+`run_cases.py` uses the same extract → propose → triage sequence as `/analyze`,
+checking present/absent/unknown findings, candidate placement, the next question,
+numeric output, reasoning, and exclusion options. Existing caches avoid new API
+calls for unchanged cases with the same model/prompts while cached responses
+remain available. Missing credentials produce a clear message. Never invoke it
+from `selftest.py` or CI; do not run live cases without authorization and a key.
+The underscore-prefixed `cases/_template.yaml` is schema guidance, not another
+clinical case, and both runners skip it. These checks do not establish clinical
+accuracy. For UI changes, also check the reveal gate, state across updates,
+document restoration, and displayed spoken text in the browser. No linter,
+formatter, or frontend build configuration is checked in.
 
 ## Repository structure
 
@@ -118,8 +136,10 @@ All application Python modules live at the root; there is no `api/` package.
 | `engine.py` | Offline deterministic severity bands, rulebook matching, exclusion state, support ordering, and next-question selection. |
 | `severity.yaml` | Handwritten harm-if-missed values, exclusion rules, and matching aliases; clinical judgment, not generated model output. |
 | `findings.yaml` | Handwritten stable finding vocabulary, labels, question strings, and labels for exclusion actions. |
-| `canonical_case.yaml` | Human-readable canonical regression case and expected behavior; never a UI data source. |
-| `selftest.py` | Offline invariant tests. |
+| `cases/` | Human-readable regression fixtures, including the original PE case and a skipped `_template.yaml`; never a UI data source. |
+| `selftest.py` | Offline invariants and expressibility checks for every case; no API key. |
+| `run_cases.py` | Manual live case runner; optional case ID, existing caches, and explicit API key required. |
+| `.github/workflows/selftest.yml` | Python 3.12 offline suite on pushes and pull requests. |
 | `main.py` | FastAPI routes, request models, pipeline orchestration, and static frontend serving. |
 | `web/index.html` | Entire frontend: HTML, CSS, and JavaScript in one file, without a build step. |
 | `requirements.txt` | Python runtime dependencies. |
@@ -303,8 +323,11 @@ Otherwise changes can appear ineffective for every consultation already cached.
 
 ## Canonical case
 
-`canonical_case.yaml` replaces the old DDXPlus-based demo fixtures. Tests and
-humans read it; nothing renders from it and no walkthrough preloads it.
+`cases/` replaces the old DDXPlus-based demo fixtures. The original canonical
+case is `cases/pe_masquerading_as_panic.yaml`; `_template.yaml` documents the
+schema and is skipped. `selftest.py` reads these fixtures offline, while
+`run_cases.py` is a manual live check. Humans also review the expected panel
+description. Nothing renders from these files and no walkthrough preloads them.
 
 The case is a 34-year-old woman with sudden chest tightness and dyspnoea. A
 photographed blister strip reveals a combined oral contraceptive; a long bus

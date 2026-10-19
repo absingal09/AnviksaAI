@@ -37,6 +37,27 @@ database. The invariant suite runs offline in about a second:
 python selftest.py
 ```
 
+GitHub Actions runs this offline suite on every push and pull request with
+Python 3.12 and no API key. It checks every `cases/*.yaml` fixture except files
+whose names start with an underscore. The original PE case is now in
+`cases/pe_masquerading_as_panic.yaml`; `cases/_template.yaml` documents the schema
+for future reviewed cases and is skipped by both runners.
+
+Live case checks are separate and manual. With `SARVAM_API_KEY` configured:
+
+```bash
+python run_cases.py
+python run_cases.py pe_masquerading_as_panic
+```
+
+`run_cases.py` sends each case's transcript and document text through the same
+extract → propose → triage sequence as `/analyze`, reporting PASS/FAIL for the
+expected findings and panel behavior. It uses the existing model-call cache;
+rerunning unchanged cases with the same model/prompts costs no new calls while
+the cached responses remain available. Missing credentials produce a clear
+message. Neither `selftest.py` nor CI runs this live runner. Case regressions do
+not establish clinical accuracy, and fixtures never populate the app's UI.
+
 ## Deploy it, free
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/absingal09/AnviksaAI)
@@ -101,8 +122,10 @@ Sarvam captures  ->  an LLM reads and proposes  ->  our rulebook triages  ->  cl
 | `engine.py` | severity band, exclusion state, support ordering, the next question. No network, no randomness. |
 | `findings.yaml` | the finding vocabulary — hand-written |
 | `severity.yaml` | harm-if-missed + what rules each condition out — **hand-written clinical judgment** |
-| `canonical_case.yaml` | the one case that defines what correct output looks like |
-| `selftest.py` | the invariants |
+| `cases/` | regression fixtures, including the original PE case and an underscore-prefixed schema template |
+| `selftest.py` | offline invariants and fixture expressibility checks; no API key |
+| `run_cases.py` | manual live case runner, with optional case ID and existing API caches |
+| `.github/workflows/selftest.yml` | runs the offline suite on every push and pull request with Python 3.12 |
 | `main.py` | FastAPI. `POST /capture` (STT/OCR + screening), `POST /analyze` (extract + propose + triage), `POST /speak` (translate + say the question aloud) |
 | `web/index.html` | single file, no build step |
 
