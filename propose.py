@@ -114,7 +114,8 @@ because what you have is vague or could be a hundred things.
 
 FOR EACH CANDIDATE
 - supported_by: ids of findings this patient HAS that support it. Only ids \
-listed as present below.
+listed as present below, including the separate "also noted, not in vocabulary" \
+present list. Those supplemental ids are ephemeral, not catalog findings.
 - opposed_by: ids of findings this patient was asked about and DENIED that \
 argue against it. Only ids listed as absent below.
 - unresolved: ids of findings NOT yet known for this patient whose answer \
@@ -122,6 +123,9 @@ would most change whether this condition belongs on the list. Only ids from \
 the catalog that appear in neither the present nor the absent list. This is \
 the most useful field you produce: it is what lets the clinician be asked \
 one good question instead of twenty.
+- Never use a supplemental id in opposed_by or unresolved. In condition names \
+and reasoning, write its clinical text, never its internal id. Supplemental \
+evidence does not change how severity or exclusions are decided.
 - reasoning: one or two sentences naming the actual findings. "Sudden \
 breathlessness with chest tightness in a patient on a combined oral \
 contraceptive after two days of bus travel" — not "clinical picture is \
@@ -170,7 +174,7 @@ _TOOL = {
                             "supported_by": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Finding ids from the PRESENT list only.",
+                                "description": "Finding ids from PRESENT or ALSO NOTED (present, not in vocabulary) only.",
                             },
                             "opposed_by": {
                                 "type": "array",
@@ -181,7 +185,7 @@ _TOOL = {
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": (
-                                    "Finding ids that are currently UNKNOWN and "
+                                    "Catalog finding ids only, currently UNKNOWN and "
                                     "whose answer would most change whether "
                                     "this condition belongs on the list."
                                 ),
@@ -214,7 +218,7 @@ _PROMPT_VERSION = llm.content_hash(
 _BY_LABEL = {m["label"].lower(): fid for fid, m in vocabulary.FINDINGS.items()}
 
 
-def _resolve(item):
+def _resolve(item, other_ids=()):
     """A model's answer -> a finding id, or None.
 
     Accepts the id, the id in any case, or the panel label. Deliberately
@@ -227,30 +231,42 @@ def _resolve(item):
     if text in vocabulary.FINDINGS:
         return text
     lowered = text.lower()
+    if lowered in other_ids:
+        return lowered
     if lowered in vocabulary.FINDINGS:
         return lowered
     return _BY_LABEL.get(lowered)
 
 
-def propose(findings):
+def propose(findings, other_findings=()):
     """findings: {finding_id: True|False} from extract.extract().
 
     -> [{"condition", "reasoning", "supported_by", "opposed_by", "unresolved"}]
 
     No probability, no score, no rank. engine.py applies severity and support
     ordering to this; nothing here is ordered meaningfully.
+    other_findings is a separate positive-evidence list. Only its ids and
+    clinical texts are sent to the model, never its source quotes.
     """
     present = sorted(f for f, state in findings.items() if state is True)
     absent = sorted(f for f, state in findings.items() if state is False)
+    other = {
+        item["id"]: item["text"] for item in other_findings
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        and re.fullmatch(r"other:\d+", item["id"])
+        and isinstance(item.get("text"), str) and item["text"].strip()
+        and not _UNSUPPORTED_REASONING.search(item["text"])
+    }
 
     # Nothing present means nothing to reason from. Denials alone cannot
     # support a candidate, and asking the model to produce a list anyway is
     # how a panel ends up showing generic prior-driven suggestions styled as
     # though they came from this patient. Abstain instead, visibly.
-    if not present:
+    if not present and not other:
         return []
 
-    cache_key = llm.content_hash(llm.config_key('propose'), _PROMPT_VERSION, json.dumps(present), json.dumps(absent))
+    cache_key = llm.content_hash(llm.config_key('propose'), _PROMPT_VERSION, json.dumps(present),
+                                 json.dumps(absent), json.dumps(other, sort_keys=True, ensure_ascii=False))
     cpath = llm.CACHE_DIR / f"propose_{cache_key}.json"
 
     def produce():
@@ -258,9 +274,11 @@ def propose(findings):
             return "\n".join(f"  {f}  ({vocabulary.label(f)})" for f in ids) or "  (none)"
 
         unknown = [f for f in vocabulary.FINDINGS if f not in findings]
+        also_noted = "\n".join(f"  {fid}  ({text})" for fid, text in other.items()) or "  (none)"
         user_content = (
             f"PRESENT — this patient has these:\n{render(present)}\n\n"
             f"ABSENT — asked about and denied:\n{render(absent)}\n\n"
+            f"ALSO NOTED, NOT IN VOCABULARY — present, text only:\n{also_noted}\n\n"
             f"UNKNOWN — not discussed, valid ids for `unresolved` "
             f"({len(unknown)} of them):\n{render(unknown)}\n\n"
             "Call propose_candidates."
@@ -269,7 +287,7 @@ def propose(findings):
 
     parsed = llm.cached(cpath, produce)
 
-    present_set, absent_set = set(present), set(absent)
+    present_set, absent_set = set(present) | set(other), set(absent)
     candidates = []
     for raw in parsed.get("candidates") or []:
         condition = (raw.get("condition") or "").strip()
@@ -277,6 +295,13 @@ def propose(findings):
         # Require a named candidate and model reasoning before validation.
         if not condition or not reasoning:
             continue
+        # Tool citations belong in supported_by, not clinician-visible prose.
+        # Never let even a fabricated supplemental id fall through as a label.
+        def expand_ids(text):
+            return re.sub(r"\bother:\d+\b", lambda match: other.get(match[0].lower(), "an unavailable finding"),
+                          text, flags=re.IGNORECASE)
+
+        condition, reasoning = expand_ids(condition), expand_ids(reasoning)
         if _UNSUPPORTED_REASONING.search(reasoning):
             # Filter cached and new responses alike, retaining the candidate
             # and its factual sentences. A decimal is not a sentence boundary.
@@ -304,7 +329,7 @@ def propose(findings):
             """
             out, dropped = [], []
             for item in raw.get(key) or []:
-                fid = _resolve(item)
+                fid = _resolve(item, other)
                 if fid is not None and fid in allowed:
                     if fid not in out:
                         out.append(fid)

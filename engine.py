@@ -426,7 +426,7 @@ class Engine:
         }
 
     # -------------------------------------------------------------- assess
-    def assess(self, candidates, findings, confirmed_exclusions=(), asked=()):
+    def assess(self, candidates, findings, confirmed_exclusions=(), asked=(), other_findings=()):
         """One call -> the whole payload. Contains no numbers, by construction.
 
         candidates:            propose.propose() output
@@ -438,13 +438,32 @@ class Engine:
                                recomputes from scratch each time.
         asked:                 findings already put to the patient but not yet
                                answered, so they are not asked again.
+        other_findings:        separate positive evidence used only for support
+                               labels, never catalog state, questions or exclusions.
         """
         def exclusion_key(condition):
             found = self.match(condition)
             return ("rated", found[0]) if found else ("unrated", condition.strip().casefold())
 
         confirmed = {exclusion_key(condition) for condition in confirmed_exclusions}
-        candidates = list(candidates)
+        other_labels = {
+            item["id"]: item["text"] for item in other_findings
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+            and re.fullmatch(r"other:\d+", item["id"])
+            and isinstance(item.get("text"), str) and item["text"].strip()
+        }
+
+        def supplemental_id(value):
+            return isinstance(value, str) and value.lower().startswith("other:")
+
+        # Keep ephemeral citations out of negative/unknown evidence even if
+        # a caller bypasses proposal validation. Do not alter catalog state.
+        candidates = [dict(cand,
+            supported_by=[f for f in cand.get("supported_by") or []
+                          if not supplemental_id(f) or f in other_labels],
+            opposed_by=[f for f in cand.get("opposed_by") or [] if not supplemental_id(f)],
+            unresolved=[f for f in cand.get("unresolved") or [] if not supplemental_id(f)],
+        ) for cand in candidates]
         proposed = {exclusion_key(c["condition"]) for c in candidates}
         for condition in sorted(set(confirmed_exclusions)):
             key = exclusion_key(condition)
@@ -466,7 +485,7 @@ class Engine:
                 "abstaining": True,
                 "message": (
                     "Nothing was extracted from this consultation yet."
-                    if not findings else
+                    if not findings and not other_labels else
                     # Rare, and it should be. propose.py casts wide on thin
                     # findings rather than staying silent — a vague complaint
                     # is the moment a clinician most needs the broad list,
@@ -506,7 +525,7 @@ class Engine:
                 # clinician an empty panel, and an empty panel is
                 # indistinguishable from "nothing to worry about".
                 "supported_by": [
-                    {"finding": f, "label": vocabulary.label(f)}
+                    {"finding": f, "label": other_labels[f] if f in other_labels else vocabulary.label(f)}
                     for f in cand.get("supported_by") or [] if isinstance(f, str)
                 ],
                 "opposed_by": [

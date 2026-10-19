@@ -719,6 +719,78 @@ check("new extraction schema and prompt participate in the cache version",
 
 
 # ===========================================================================
+section("supplemental proposal evidence stays outside catalog state")
+
+other_evidence = [{"id": "other:0", "text": "Eyelid twitches 5 times", "evidence": "PRIVATE_QUOTE 95% probability"}]
+other_candidate = {"condition": "Eyelid myokymia", "reasoning": "Eyelid twitching persists.",
+                   "supported_by": ["other:0", "other:99"], "opposed_by": ["other:0"],
+                   "unresolved": ["other:0", "calf_swelling_unilateral"]}
+
+
+def proposed_other(items, candidate=other_candidate):
+    keys = []
+
+    def invoke(path, produce):
+        keys.append(str(path))
+        return produce()
+
+    with patch.object(llm, "cached", side_effect=invoke), \
+            patch.object(llm, "call_tool", return_value={"candidates": [candidate]}) as call, \
+            patch("sys.stdout", io.StringIO()):
+        result = propose.propose({}, items)
+    return result, call, keys
+
+
+other_candidates, other_call, other_keys = proposed_other(other_evidence)
+check("supplemental-only evidence reaches proposal as a present text list without source quotes",
+      other_call.call_count == 1 and "ALSO NOTED, NOT IN VOCABULARY" in other_call.call_args.args[1]
+      and "other:0  (Eyelid twitches 5 times)" in other_call.call_args.args[1]
+      and "PRIVATE_QUOTE" not in other_call.call_args.args[1]
+      and "95% probability" not in other_call.call_args.args[1])
+check("proposal keeps existing supplemental support and drops nonexistent supplemental references",
+      len(other_candidates) == 1 and other_candidates[0]["supported_by"] == ["other:0"])
+check("supplemental ids cannot become opposed or unknown proposal findings",
+      other_candidates[0]["opposed_by"] == []
+      and other_candidates[0]["unresolved"] == ["calf_swelling_unilateral"])
+other_triage = eng.assess(other_candidates, {}, other_findings=other_evidence)
+check("supplemental-only candidates do not abstain and unlisted conditions stay unrated",
+      other_triage["abstaining"] is False and len(other_triage["unrated"]) == 1
+      and other_triage["unrated"][0]["severity_band"] == "unrated")
+check("supplemental support chips use clinical text instead of the ephemeral id",
+      other_triage["unrated"][0]["supported_by"] == [{"finding": "other:0", "label": "Eyelid twitches 5 times"}])
+check("supplemental evidence never enters catalog state or unknown-finding checks",
+      other_triage["findings_present"] == other_triage["findings_absent"] == other_triage["doesnt_fit"] == []
+      and "other:0" not in vocabulary.FINDINGS)
+check("supplemental ids never supply the next question or its asked tracking",
+      other_triage["next_question"]["finding"] == "calf_swelling_unilateral"
+      and eng.assess(other_candidates, {}, asked=["calf_swelling_unilateral"], other_findings=other_evidence)["next_question"] is None)
+rogue_other = dict(other_candidate, unresolved=["other:0"], opposed_by=["other:0"], supported_by=["other:99"])
+rogue_payload = eng.assess([rogue_other], {}, other_findings=other_evidence)
+check("triage defensively drops invalid supplemental support and never asks about supplemental evidence",
+      rogue_payload["next_question"] is None and rogue_payload["unrated"][0]["supported_by"] == []
+      and rogue_payload["unrated"][0]["opposed_by"] == [])
+other_pe = dict(other_candidates[0], condition="Pulmonary embolism", unresolved=[])
+unconfirmed_other = eng.assess([other_pe], {}, other_findings=other_evidence)
+confirmed_other = eng.assess([other_pe], {}, confirmed_exclusions=["Acute pulmonary embolism"], other_findings=other_evidence)
+check("supplemental evidence cannot exclude a condition without clinician confirmation",
+      len(unconfirmed_other["cant_miss"]) == 1 and unconfirmed_other["ruled_out"] == []
+      and unconfirmed_other["cant_miss"][0]["exclusion_options"] == eng.exclusion_options("Pulmonary embolism")
+      and not any("other:" in json.dumps(option) for option in unconfirmed_other["cant_miss"][0]["exclusion_options"])
+      and confirmed_other["cant_miss"] == [] and len(confirmed_other["ruled_out"]) == 1)
+expanded_candidates, _, _ = proposed_other(other_evidence, dict(other_candidate, reasoning="other:0 was noted; other:99 is unavailable."))
+check("supplemental citations in generated prose expand to text and never leak internal ids",
+      "other:" not in expanded_candidates[0]["reasoning"]
+      and "Eyelid twitches 5 times" in expanded_candidates[0]["reasoning"])
+_, _, changed_other_keys = proposed_other([dict(other_evidence[0], text="Persistent eyelid twitching")])
+_, _, changed_quote_keys = proposed_other([dict(other_evidence[0], evidence="DIFFERENT PRIVATE QUOTE")])
+check("proposal caches include supplemental ids and text but never source quotes",
+      other_keys != changed_other_keys and other_keys == changed_quote_keys)
+check("proposal schema and prompt invalidate its version alongside finding labels",
+      propose._PROMPT_VERSION == llm.content_hash(propose.SYSTEM_PROMPT, json.dumps(propose._TOOL, sort_keys=True),
+          json.dumps({fid: meta["label"] for fid, meta in vocabulary.FINDINGS.items()}, sort_keys=True, ensure_ascii=False)))
+
+
+# ===========================================================================
 section("candidate reasoning does not invent certainty")
 withheld_reasoning = "Reasoning withheld: the model used numeric or probability wording."
 
