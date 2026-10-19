@@ -126,6 +126,32 @@ accuracy. For UI changes, also check the reveal gate, state across updates,
 document restoration, and displayed spoken text in the browser. No linter,
 formatter, or frontend build configuration is checked in.
 
+## Delegation
+
+- Delegate to a sub-agent only for self-contained read-heavy work: searching,
+  mapping call sites, running the offline tests, reviewing a diff before commit,
+  or checking docs against code.
+- Do not delegate when the answer is in files already in context, or when the
+  task needs fewer than about three file reads.
+- Never delegate edits to `engine.py`, `extract.py`, `propose.py`, `llm.py`,
+  `severity.yaml`, `findings.yaml`, or `web/index.html`. The main agent writes
+  those files.
+- Sub-agents never commit, push, or run live-API commands, including
+  `run_cases.py`. Live testing belongs to the main agent and still requires
+  authorization.
+- Run at most 3 sub-agents at once. Ask each for a short summary, not raw file
+  contents or logs. Sub-agents must not spawn further agents.
+- The main agent must open and confirm any file:line claim from a sub-agent
+  before relying on it for a change.
+- Before every commit, ask the `reviewer` agent to review the diff and the
+  `test_runner` agent to run `python selftest.py`.
+
+Shared roles are defined in `.codex/agents/`: `explorer`, `test_runner`,
+`reviewer`, and `docs_checker`. The first, second, and fourth use `gpt-6-luna`
+with low reasoning effort; the reviewer inherits the default model and uses
+medium reasoning effort. `.codex/config.toml` limits concurrent spawned-agent
+threads to 3.
+
 ## Repository structure
 
 All application Python modules live at the root; there is no `api/` package.
