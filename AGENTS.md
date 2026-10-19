@@ -61,8 +61,12 @@ python -m pip install -r requirements.txt
 
 Copy `.env.example` to `.env` and set `SARVAM_API_KEY`. The same credential is
 used for STT, vision, chat, speech synthesis, and translation. The optional
-`SARVAM_CHAT_MODEL` defaults to `sarvam-105b`; the conversations variant is not
-the default for structured extraction. Never commit real credentials. If a key
+task settings default to `gemma4` for screening and `glm5.3` for independent
+extraction/proposal calls, using Sarvam V2 (beta access required). Configure
+`SARVAM_SCREEN_MODEL`, `SARVAM_EXTRACT_MODEL`, and `SARVAM_PROPOSE_MODEL`
+independently. The legacy `SARVAM_CHAT_MODEL` overrides all defaults; task settings
+take precedence. `sarvam-105b` remains a V1 option for keys without V2 access.
+Never silently change models on a provider failure. Never commit real credentials. If a key
 is committed, rotate it in Sarvam's dashboard; deleting it does not remove it
 from Git history.
 
@@ -128,7 +132,7 @@ All application Python modules live at the root; there is no `api/` package.
 
 | Path | Responsibility |
 | --- | --- |
-| `capture.py` | Sarvam `saaras-v3` diarized batch STT, `sarvam-vision` OCR, translation, and `bulbul-v3` speech; content-hash disk caches and retries. |
+| `capture.py` | Sarvam `saaras:v4` diarized batch STT, `sarvam-vision` OCR, pinned `sarvam-translate:v1`, and Hindi/English `bulbul:v4-flash` speech (v3 for other existing languages); model-aware content-hash caches and retries. |
 | `llm.py` | Shared chat client, forced structured tool calls, timeout/retry handling, deterministic sampling, and disk cache helpers. |
 | `vocabulary.py` | Loads `findings.yaml` once; exposes IDs, labels, questions, investigation labels, and clinician-only checks. |
 | `extract.py` | Independently screens each document, then maps transcript/documents to fixed-vocabulary findings and supporting quotes. |
@@ -189,6 +193,25 @@ despite no mention in the transcript; that failure caused a provider change.
 Screening is its own additional model call. Keep `llm.py` ignorant of medicine:
 it takes a system prompt, user content, and tool schema, and returns parsed
 arguments. Do not move clinical prompt assembly into that shared helper.
+
+Chat models are selected per task in `llm.config()`. Gemma screening uses a small
+nonreasoning budget; GLM/DeepSeek reasoning needs a larger shared thinking/tool
+budget. The installed SDK predates V2 chat, so `llm.py` uses HTTPX for V2 and the
+SDK for V1. Preserve forced tool calls, changed retry seeds, explicit reasoning
+settings and model/profile-aware cache keys. Never turn malformed tool output
+into a successful empty extraction. The offline suite tests both transports.
+
+Capture defaults and overrides are documented in `.env.example`:
+`SARVAM_STT_MODEL`, `SARVAM_TRANSLATION_MODEL`, `SARVAM_TTS_MODEL`. TTS `auto`
+uses documented, live-verified v4 Hindi/English personas; other existing
+languages keep v3 pending voice verification. Malayalam/Odia have no native v4
+personas currently. Do not substitute an English persona for another language.
+Hash the selected capture model and speech settings into caches as well.
+
+The 2026-10-19 single-case model comparison is recorded in README's Models
+section. GLM and DeepSeek each passed 27/28 live PE expectations, leaving
+`prior_panic_attacks` unknown. This is an unresolved live miss, not a passing
+clinical evaluation. Do not alter the fixture or infer absence to hide it.
 
 ## Non-negotiable behavior
 

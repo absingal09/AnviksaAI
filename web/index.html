@@ -210,7 +210,7 @@ button:disabled{opacity:.35;cursor:default}
     <div class="patient" id="patientbar">—</div>
     <div class="spacer"></div>
     <div class="svc">
-      <span id="s-stt"><i></i>saaras-v3</span>
+      <span id="s-stt"><i></i>transcription</span>
       <span id="s-vis"><i></i>sarvam-vision</span>
     </div>
     <button id="new-consult">New consultation</button>
@@ -315,7 +315,7 @@ const ICON_PLAY='<svg viewBox="0 0 16 16" fill="currentColor" style="width:9px;h
 // for what this clinician actually captured, this session.
 // ===================================================================
 
-// bulbul-v3's full TTS voice set — 11 languages, a SUBSET of saaras-v3 STT's
+// Existing Bulbul TTS language set — 11 languages, a SUBSET of Saaras STT's
 // 23 — used only to populate the language dropdown so it can't drift out of
 // sync with what the STT/TTS pipeline actually supports. `native` is used
 // in the header bar; `label` is the dropdown's own display text.
@@ -850,7 +850,7 @@ function paintPatientBar(){
 // language are collected here, before the live view appears — the
 // selected language has to be known up front since it's sent on every
 // live-recording/document-scan call from here on. Dropdown is populated
-// from LANGUAGES only (bulbul-v3/saaras-v3's supported set), not a
+// from LANGUAGES only (the existing shared TTS/STT language set), not a
 // hand-typed <option> list, so it can't drift out of sync.
 (function initSetup(){
   const sel=$('f-lang');
@@ -957,7 +957,7 @@ async function liveSend(){
       e: data.transcript_en ? escHtml(data.transcript_en) : '',
       audioSrc: URL.createObjectURL(liveBlob),
     });
-    svc('s-stt',1); $('mode').textContent='saaras-v3 · codemix · live';
+    svc('s-stt',1); $('mode').textContent='diarized · codemix · live';
     if(data.transcript){
       liveTranscriptExtra += (liveTranscriptExtra?'\n':'') + data.transcript;
       hasLiveInput=true; paintDX(); paintCM();

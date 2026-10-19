@@ -8,7 +8,7 @@
 
     POST /speak     application/json. {"finding": id, "language_code": str}
         -> the question translated into the patient's language, spoken by
-        bulbul-v3, PLUS the translated text so it can be shown on screen and
+        Bulbul, PLUS the translated text so it can be shown on screen and
         checked. Refuses clinician-only questions.
 
     POST /analyze   application/json. extract -> propose -> triage, over

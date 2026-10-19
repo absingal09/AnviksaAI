@@ -20,8 +20,10 @@ happens no amount of green output here means the panel is useful. Do not read
 a pass as a safety claim.
 """
 
+import base64
 import io
 import json
+import os
 import re
 import runpy
 import subprocess
@@ -29,7 +31,8 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import httpx
 import yaml
@@ -39,6 +42,7 @@ import extract
 import llm
 import propose
 import vocabulary
+import capture
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -514,15 +518,16 @@ def offline_chat(reply):
         requests.append(body)
         message, finish_reason = reply(body, len(requests))
         return httpx.Response(200, json={
-            "id": "offline-chat", "created": 0, "model": llm.MODEL,
+            "id": "offline-chat", "created": 0, "model": body["model"],
             "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
         })
 
     with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
         sdk = llm.SarvamAI(api_subscription_key="offline-test-key", httpx_client=transport)
-        with patch.object(llm, "client", return_value=sdk), patch.object(llm.time, "sleep"):
+        with patch.object(llm, "client", return_value=sdk), patch.object(llm.time, "sleep"), \
+                patch.dict(os.environ, {"SARVAM_SCREEN_MODEL": "sarvam-105b"}):
             try:
-                result = llm.call_tool("offline system", "offline input", extract._SCREEN_TOOL, max_tokens=256)
+                result = llm.call_tool("offline system", "offline input", extract._SCREEN_TOOL, task="screen", max_tokens=256)
                 error = None
             except Exception as exc:
                 result, error = None, exc
@@ -826,6 +831,158 @@ with patch.dict(vocabulary.FINDINGS["headache"], {"label": "Changed label for an
     changed_key = proposal_cache_key()
 check("changing only a finding label invalidates proposal responses", original_key != changed_key)
 check("unchanged finding labels retain the same proposal cache key", original_key == proposal_cache_key())
+
+
+# ===========================================================================
+section("independent chat models, V2 transport and cache invalidation")
+with patch.dict(os.environ, {}, clear=True):
+    check("default chat models are Gemma screening and separate GLM clinical calls",
+          [llm.config(task)["model"] for task in ("screen", "extract", "propose")]
+          == ["gemma4", "glm5.3", "glm5.3"])
+    original_profiles = {task: llm.config_key(task) for task in ("screen", "extract", "propose")}
+    with patch.dict(os.environ, {"SARVAM_EXTRACT_MODEL": "deepseekv4.1-flash"}):
+        check("changing extraction model invalidates only extraction's profile",
+              llm.config_key("extract") != original_profiles["extract"]
+              and all(llm.config_key(task) == original_profiles[task] for task in ("screen", "propose")))
+    with patch.dict(os.environ, {"SARVAM_CHAT_MODEL": "sarvam-105b", "SARVAM_SCREEN_MODEL": "gemma4"}):
+        check("legacy chat override still works and task settings take precedence",
+              llm.config("extract")["api_version"] == "v1"
+              and llm.config("propose")["model"] == "sarvam-105b"
+              and llm.config("screen")["model"] == "gemma4")
+    with patch.dict(os.environ, {"SARVAM_EXTRACT_MODEL": "unknown-model"}):
+        try:
+            llm.config("extract")
+            invalid_model_rejected = False
+        except ValueError:
+            invalid_model_rejected = True
+        check("unknown chat model names fail before a paid request", invalid_model_rejected)
+
+
+def offline_v2(replies, *, task="extract"):
+    requests = []
+
+    def respond(request):
+        requests.append((str(request.url), json.loads(request.content)))
+        status, body = replies[min(len(requests) - 1, len(replies) - 1)]
+        return httpx.Response(status, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as transport, \
+            patch.object(llm, "http_client", return_value=transport), \
+            patch.object(llm, "client", side_effect=AssertionError("V2 must not use the V1 SDK")), \
+            patch.object(llm.time, "sleep"), \
+            patch.dict(os.environ, {"SARVAM_API_KEY": "offline-test-key"}, clear=True):
+        try:
+            return llm.call_tool("offline system", "offline input", extract._SCREEN_TOOL, task=task), requests, None
+        except Exception as exc:
+            return None, requests, exc
+
+
+v2_success = {"choices": [{"message": {"tool_calls": [{"function": {
+    "name": extract._SCREEN_TOOL["function"]["name"], "arguments": json.dumps(screen_arguments),
+}}]}}]}
+result, requests, error = offline_v2([(200, v2_success)])
+check("V2 returns the requested structured tool object", result == screen_arguments and error is None)
+body = requests[0][1]
+check("GLM uses the V2 endpoint with an explicit reasoning budget",
+      requests[0][0] == "https://api.sarvam.ai/v2/chat/completions"
+      and body["model"] == "glm5.3" and body["reasoning_effort"] == "high"
+      and body["max_tokens"] == 16384 and body["temperature"] == 0 and body["seed"] == 0
+      and body["tool_choice"]["function"]["name"] == extract._SCREEN_TOOL["function"]["name"])
+result, requests, error = offline_v2([(200, v2_success)], task="screen")
+check("Gemma screening keeps its separate short nonreasoning request",
+      result == screen_arguments and requests[0][1]["model"] == "gemma4"
+      and requests[0][1]["max_tokens"] == 256 and requests[0][1]["reasoning_effort"] is None)
+for label, bad in (
+    ("empty choices", {"choices": []}),
+    ("malformed tool entry", {"choices": [{"message": {"tool_calls": [None]}}]}),
+    ("nonobject arguments", {"choices": [{"message": {"tool_calls": [{"function": {
+        "name": extract._SCREEN_TOOL["function"]["name"], "arguments": "[]"}}]}}]}),
+    ("wrong tool name", {"choices": [{"message": {"tool_calls": [{"function": {
+        "name": "wrong_tool", "arguments": "{}"}}]}}]}),
+    ("invalid JSON", {"choices": [{"message": {"tool_calls": [{"function": {
+        "name": extract._SCREEN_TOOL["function"]["name"], "arguments": "broken JSON"}}]}}]}),
+):
+    result, requests, error = offline_v2([(200, bad), (200, v2_success)])
+    check(f"V2 {label} retries without becoming empty findings",
+          result == screen_arguments and error is None and len(requests) == 2
+          and [request[1]["seed"] for request in requests] == [0, 1])
+result, requests, error = offline_v2([(429, {"error": "rate limited"}), (200, v2_success)])
+check("V2 throttling retries with a fresh seed", result == screen_arguments and len(requests) == 2)
+result, requests, error = offline_v2([(403, {"error": "model not enabled"})])
+check("V2 access failures are surfaced without silently changing models",
+      result is None and isinstance(error, httpx.HTTPStatusError) and len(requests) == 1)
+
+# Exercise each real caller's cache key, not just the shared configuration helper.
+for task, invoke, cached_value in [
+    ("screen", lambda: extract.screen_document("offline document"), screen_arguments),
+    ("extract", lambda: extract.extract("offline transcript"), {"present": [], "absent": []}),
+    ("propose", lambda: propose.propose({"headache": True}), {"candidates": []}),
+]:
+    paths = []
+    def record_cache(path, produce):
+        paths.append(path)
+        return cached_value
+    with patch.dict(os.environ, {}, clear=True), patch.object(llm, "cached", side_effect=record_cache):
+        invoke()
+        invoke()
+        with patch.dict(os.environ, {f"SARVAM_{task.upper()}_MODEL": "sarvam-105b"}):
+            invoke()
+    check(f"{task} caches unchanged inputs but invalidates on model changes",
+          paths[0] == paths[1] and paths[0] != paths[2])
+
+
+# ===========================================================================
+section("capture model selection and model-aware caches stay offline")
+with patch.dict(os.environ, {}, clear=True):
+    check("Hindi and English use their own documented v4 voices",
+          capture.speech_config("hi-IN") == {"model": "bulbul:v4-flash", "speaker": "aparna_hi_customer"}
+          and capture.speech_config("en-IN") == {"model": "bulbul:v4-flash", "speaker": "aparna_en_companion"})
+    check("remaining supported languages retain v3 instead of an English persona",
+          all(capture.speech_config(code) == {"model": "bulbul:v3", "speaker": "shubh"}
+              for code in ("bn-IN", "gu-IN", "kn-IN", "ml-IN", "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN")))
+
+with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-capture-") as capture_test_dir:
+    fake = Mock()
+    fake.text_to_speech.convert.return_value = SimpleNamespace(audios=[base64.b64encode(b"offline wav").decode()])
+    fake.text.translate.return_value = SimpleNamespace(translated_text="offline translated question")
+    job = fake.speech_to_text_job.create_job.return_value
+    job.is_failed.return_value = False
+    def write_transcript(*, output_dir):
+        (Path(output_dir) / "question.wav.json").write_text(json.dumps({"transcript": "offline question"}), encoding="utf-8")
+    job.download_outputs.side_effect = write_transcript
+    audio_path = Path(capture_test_dir) / "question.wav"
+    audio_path.write_bytes(b"offline audio")
+    with patch.object(capture, "CACHE_DIR", Path(capture_test_dir)), \
+            patch.object(capture, "client", return_value=fake), patch.dict(os.environ, {}, clear=True):
+        capture.speak("offline question", "hi-IN")
+        capture.speak("offline question", "hi-IN")
+        check("v4 WAV generation is cached with explicit codec and sample rate",
+              fake.text_to_speech.convert.call_count == 1
+              and fake.text_to_speech.convert.call_args.kwargs["model"] == "bulbul:v4-flash"
+              and fake.text_to_speech.convert.call_args.kwargs["output_audio_codec"] == "wav"
+              and fake.text_to_speech.convert.call_args.kwargs["speech_sample_rate"] == 24000)
+        with patch.dict(os.environ, {"SARVAM_TTS_MODEL": "bulbul:v3"}):
+            capture.speak("offline question", "hi-IN")
+        check("switching TTS models cannot reuse old audio",
+              fake.text_to_speech.convert.call_count == 2
+              and fake.text_to_speech.convert.call_args.kwargs["speaker"] == "shubh")
+        capture.translate("offline question", "en-IN", "hi-IN")
+        capture.translate("offline question", "en-IN", "hi-IN")
+        check("translation pins sarvam-translate:v1 and caches repeated questions",
+              fake.text.translate.call_count == 1
+              and fake.text.translate.call_args.kwargs["model"] == "sarvam-translate:v1")
+        with patch.dict(os.environ, {"SARVAM_TRANSLATION_MODEL": "mayura:v1"}):
+            capture.translate("offline question", "en-IN", "hi-IN")
+        check("translation model changes invalidate translated text", fake.text.translate.call_count == 2)
+        capture.transcribe(audio_path, "en-IN")
+        capture.transcribe(audio_path, "en-IN")
+        check("Saaras v4 batch STT retains diarization and caches repeated audio",
+              fake.speech_to_text_job.create_job.call_count == 1
+              and fake.speech_to_text_job.create_job.call_args.kwargs["model"] == "saaras:v4"
+              and fake.speech_to_text_job.create_job.call_args.kwargs["with_diarization"] is True)
+        with patch.dict(os.environ, {"SARVAM_STT_MODEL": "saaras:v3"}):
+            capture.transcribe(audio_path, "en-IN")
+        check("STT model changes invalidate old transcripts", fake.speech_to_text_job.create_job.call_count == 2)
 
 
 # ===========================================================================

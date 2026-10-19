@@ -136,8 +136,13 @@ def check_expectations(case, findings, payload, engine):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("case_id", nargs="?", help="Run only this case.id (default: all cases)")
+    parser.add_argument("--extract-model", help="Override the extraction model for this live run")
+    parser.add_argument("--propose-model", help="Override the proposal model for this live run")
     args = parser.parse_args()
     load_dotenv(ROOT / ".env")
+    for task in ("extract", "propose"):
+        if getattr(args, f"{task}_model"):
+            os.environ[f"SARVAM_{task.upper()}_MODEL"] = getattr(args, f"{task}_model")
     if not os.environ.get("SARVAM_API_KEY", "").strip():
         print("SARVAM_API_KEY is missing. Set it in .env or the environment before running live cases.", file=sys.stderr)
         return 2
@@ -145,6 +150,7 @@ def main():
     # Provider modules are loaded only after the explicit credential check.
     import extract
     import propose
+    import llm
     from engine import Engine
 
     try:
@@ -156,6 +162,7 @@ def main():
                 raise ValueError(f"Unknown case ID {args.case_id!r}. Available: {available}")
             cases = selected
         engine = Engine.load()
+        print(f"Models: extract={llm.config('extract')['model']}, propose={llm.config('propose')['model']}")
     except (OSError, ValueError, yaml.YAMLError) as exc:
         print(f"Cannot load cases: {exc}", file=sys.stderr)
         return 2

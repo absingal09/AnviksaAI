@@ -58,6 +58,58 @@ the cached responses remain available. Missing credentials produce a clear
 message. Neither `selftest.py` nor CI runs this live runner. Case regressions do
 not establish clinical accuracy, and fixtures never populate the app's UI.
 
+## Models
+
+All models use the same `SARVAM_API_KEY`; no second provider credential is needed.
+
+| Task | Default |
+| --- | --- |
+| Document screening | `gemma4`, Sarvam V2 |
+| Evidence extraction | `glm5.3`, Sarvam V2, high reasoning |
+| Candidate proposals | `glm5.3`, a separate V2 call, high reasoning |
+| Diarized transcription | `saaras:v4` |
+| Document OCR | `sarvam-vision` / `doc_ai` |
+| Translation | Explicit `sarvam-translate:v1` |
+| Spoken questions | `bulbul:v4-flash` for Hindi/English; `bulbul:v3` for the other existing languages |
+
+The v4 speech voices are `aparna_hi_customer` and `aparna_en_companion`. The
+remaining languages keep their existing v3 voice pending persona verification;
+Malayalam and Odia currently lack native v4 personas. Translation failure still
+prevents speech. No language was added, and native-speaker review remains needed.
+
+V2 chat access is beta and must be enabled for the key. The local key was checked.
+See `.env.example` for independent `SARVAM_SCREEN_MODEL`, `SARVAM_EXTRACT_MODEL`,
+and `SARVAM_PROPOSE_MODEL` overrides, plus speech/translation settings. The legacy
+`SARVAM_CHAT_MODEL` overrides all three chat defaults; per-task settings take
+precedence. Set it to `sarvam-105b` for V1-only keys. There is no silent model
+fallback. Model settings are included in cache keys, so switching models causes
+fresh paid calls without reusing obsolete results. Restart the server after
+changing settings. The severity, support, exclusion and question engine stays
+deterministic and unchanged.
+
+The existing authored PE case was compared on 2026-10-19: Gemma/Gemma passed
+25/28 expectations, GLM/GLM and DeepSeek Flash/DeepSeek Flash each passed 27/28.
+Both reasoning models left `prior_panic_attacks` unknown instead of the expected
+absent; neither passes the entire case. Both retained PE, panic, the calf
+question and the required unknown findings. The earlier Sarvam 105B run passed
+25/28. These are one-case observations, not measured accuracy or proof that one
+model is universally best. No fixture or clinical rule was changed to improve
+the result. Screening, translation, Hindi/English WAV output, and v4 diarized STT
+also passed live compatibility checks; synthesized question audio was used for
+STT, which does not evaluate real consultation transcription quality.
+
+Compare cached model configurations manually with:
+
+```bash
+python run_cases.py pe_masquerading_as_panic --extract-model glm5.3 --propose-model glm5.3
+python run_cases.py pe_masquerading_as_panic --extract-model deepseekv4.1-flash --propose-model deepseekv4.1-flash
+```
+
+Model/API references: [V2 chat](https://docs.sarvam.ai/api-reference/chat/chat-completions-v2),
+[Saaras](https://docs.sarvam.ai/api/getting-started/models/saaras),
+[Bulbul v4 voices and migration](https://docs.sarvam.ai/api/api-guides-tutorials/text-to-speech/best-practices),
+[translation](https://docs.sarvam.ai/api-reference/text/translate-text).
+
 ## Deploy it, free
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/absingal09/AnviksaAI)
@@ -116,7 +168,7 @@ Sarvam captures  ->  an LLM reads and proposes  ->  our rulebook triages  ->  cl
 
 | File | What |
 |---|---|
-| `capture.py` | `saaras-v3` batch STT (diarized), `sarvam-vision` on documents, translation, `bulbul-v3` speech. All disk-cached by content hash. |
+| `capture.py` | `saaras:v4` batch STT (diarized), `sarvam-vision` on documents, pinned translation, language-specific `bulbul:v4-flash` / `bulbul:v3` speech. All disk-cached by content hash and model settings. |
 | `extract.py` | transcript + documents → findings, three-valued, each with the quote that justifies it. Also screens each document: is this clinical at all? |
 | `propose.py` | findings → candidate conditions + what supports and opposes each. Never sees the transcript. |
 | `engine.py` | severity band, exclusion state, support ordering, the next question. No network, no randomness. |
