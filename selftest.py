@@ -577,6 +577,80 @@ check("case ID cannot insert HTML into the header", browser_result.get("escaped_
 
 
 # ===========================================================================
+section("analysis results follow the current consultation and evidence")
+try:
+    browser_result = browser_checks(r"""
+function stage(marker){return {abstaining:false,message:null,
+  cant_miss:[{condition:marker,reasoning:'offline fixture',severity_band:'critical',support:'limited',
+    supported_by:[],opposed_by:[],exclusion_options:[]}],
+  differential:[],unrated:[],ruled_out:[],doesnt_fit:[],next_question:null};}
+function prime(){
+  run('reset()');context.priorStage=stage('old-result');
+  run(`dxState={stage:priorStage};cmState={stage:priorStage};committed=true;hasLiveInput=true;
+    liveTranscriptExtra='offline evidence';paintDX();paintCM();paintQB();paintMIS();`);
+}
+function response(data){return {ok:true,json:async()=>data};}
+prime();run(`liveTranscriptExtra='';scannedDocs=[{use:false,text:'removed document'}];`);
+await run('runAnalyze()');
+results.empty_clears = run('dxState===null && cmState===null') && !elements.get('cm').innerHTML.includes('old-result');
+prime();run(`liveTranscriptExtra='  ';scannedDocs=[];`);await run('runAnalyze()');
+results.whitespace_clears = run('dxState===null && cmState===null');
+
+prime();let finishOld;
+context.fetch=()=>new Promise(resolve=>{finishOld=resolve;});
+const oldRequest=run('runAnalyze()');run('reset()');
+results.reset_unlocks = run('analyzeInFlight===false');
+finishOld(response(stage('old-response')));await oldRequest;
+results.reset_ignores_response = run('dxState===null && cmState===null');
+
+prime();const finishes=[];
+context.fetch=()=>new Promise(resolve=>finishes.push(resolve));
+const older=run('runAnalyze()');run(`reset();committed=true;hasLiveInput=true;liveTranscriptExtra='new evidence';`);
+const newer=run('runAnalyze()');
+finishes[0](response(stage('old-response')));await older;
+results.old_request_does_not_unlock_new = finishes.length===2 && run('analyzeInFlight===true && dxState===null');
+if(finishes[1])finishes[1](response(stage('new-response')));await newer;
+results.new_response_wins = run(`dxState && dxState.stage.cant_miss[0].condition==='new-response'`);
+
+prime();let finishRemoved;
+context.fetch=()=>new Promise(resolve=>{finishRemoved=resolve;});
+const removedRequest=run('runAnalyze()');run(`liveTranscriptExtra='';scannedDocs=[];`);await run('runAnalyze()');
+finishRemoved(response(stage('removed-evidence-result')));await removedRequest;
+results.removed_response_ignored = run('dxState===null && cmState===null');
+
+prime();context.fetch=async()=>({ok:false,status:502,json:async()=>({detail:'provider unavailable'})});
+await run('runAnalyze()');
+results.http_failure_visible = document.getElementById('analysis-error').textContent.includes('provider unavailable')
+  && document.getElementById('analysis-error').textContent.toLowerCase().includes('stale')
+  && elements.get('cmtag').textContent.toLowerCase().includes('stale')
+  && elements.get('cm').innerHTML.includes('old-result');
+context.fetch=async()=>response(stage('recovered-result'));await run('runAnalyze()');
+results.recovery_clears_error = document.getElementById('analysis-error').textContent===''
+  && !elements.get('cmtag').textContent.toLowerCase().includes('stale')
+  && elements.get('cm').innerHTML.includes('recovered-result');
+prime();context.fetch=async()=>{throw new Error('connection lost');};await run('runAnalyze()');
+results.network_failure_visible = document.getElementById('analysis-error').textContent.includes('connection lost')
+  && document.getElementById('analysis-error').textContent.toLowerCase().includes('stale');
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+for key, description in [
+    ("empty_clears", "removing all included evidence clears old results"),
+    ("whitespace_clears", "whitespace-only evidence also clears results"),
+    ("reset_unlocks", "reset allows a new analysis without waiting for the old request"),
+    ("reset_ignores_response", "analysis responses from before reset are ignored"),
+    ("old_request_does_not_unlock_new", "an obsolete request cannot unlock a newer request"),
+    ("new_response_wins", "the new consultation receives its own analysis"),
+    ("removed_response_ignored", "removed evidence cannot return via an in-flight response"),
+    ("http_failure_visible", "HTTP failures retain old results with a visible stale warning"),
+    ("recovery_clears_error", "successful analysis clears the previous error and stale marker"),
+    ("network_failure_visible", "network failures are visible instead of silently reverting"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
+
+
+# ===========================================================================
 section("determinism — identical input, identical output")
 # ===========================================================================
 # Confirmed live once: identical input returned different findings run to run

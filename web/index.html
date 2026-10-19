@@ -159,6 +159,8 @@ button:disabled{opacity:.35;cursor:default}
 .mis svg{width:13px;height:13px;flex-shrink:0;margin-top:3px;color:var(--warning)}
 .note{font-family:var(--mono);font-size:12px;line-height:1.7;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--hair);border-radius:7px;padding:12px 13px;white-space:pre-wrap}
 .hint{font-size:11.5px;color:var(--muted);text-align:center;flex-shrink:0}
+.analysis-error{padding:10px 14px;border:1px solid var(--warning);border-radius:7px;color:var(--warning);background:var(--surface);flex-shrink:0}
+.analysis-stale{opacity:.65}
 .hide{display:none}
 @media(max-width:1180px){.cols{grid-template-columns:1fr}.app{height:auto}.card.scroll,.card{max-height:none!important}}
 
@@ -214,6 +216,7 @@ button:disabled{opacity:.35;cursor:default}
     <button id="new-consult">New consultation</button>
   </div>
 
+  <div id="analysis-error" class="analysis-error hide" role="alert"></div>
   <div class="cols">
     <!-- LEFT: capture -->
     <div class="col">
@@ -442,6 +445,7 @@ function svc(id,on){$(id).classList.toggle('on',on)}
 // narrative to gate against anymore — this is the only path to a reveal.
 // ===================================================================
 let dxState=null, cmState=null;
+let analysisError=null;
 let committed=false, hasLiveInput=false;
 // Findings already put to the patient. Sent with every /analyze call so the
 // panel cannot ask the same thing twice — see runAnalyze().
@@ -463,7 +467,7 @@ function paintDX(){
   const s=dxState.stage;
   if(s.abstaining){
     $('dx').innerHTML=`<div class="empty">${esc(s.message||'Nothing to show yet.')}</div>`;
-    $('dxtag').textContent='';
+    $('dxtag').textContent=analysisError?'stale — analysis failed':'';
     return;
   }
   let html='';
@@ -480,7 +484,7 @@ function paintDX(){
         + s.unrated.map(r=>candidateRow(r)).join('');
   }
   $('dx').innerHTML=html||'<div class="empty">—</div>';
-  $('dxtag').textContent='';
+  $('dxtag').textContent=analysisError?'stale — analysis failed':'';
 }
 function paintCM(){
   if(!committed || !hasLiveInput){ $('cm').innerHTML=GATE_MSG; $('cmtag').textContent=''; return; }
@@ -488,7 +492,7 @@ function paintCM(){
   const s=cmState.stage;
   if(s.abstaining){
     $('cm').innerHTML=`<div class="empty">${esc(s.message||'Nothing to show yet.')}</div>`;
-    $('cmtag').textContent='';
+    $('cmtag').textContent=analysisError?'stale — analysis failed':'';
     return;
   }
   let html=(s.cant_miss||[]).map(r=>candidateRow(r,{excludable:true})).join('');
@@ -502,7 +506,7 @@ function paintCM(){
         + s.ruled_out.map(r=>candidateRow(r,{gone:true,suppressNew:true})).join('');
   }
   $('cm').innerHTML=html;
-  $('cmtag').textContent=cmState.tag||'not yet ruled out';
+  $('cmtag').textContent=analysisError?'stale — analysis failed':(cmState.tag||'not yet ruled out');
   wireExclusionButtons();
 }
 
@@ -678,14 +682,39 @@ function docText(){
   return scannedDocs.filter(d=>d.use).map(d=>d.text).join('\n\n');
 }
 let analyzeTimer=null, analyzeInFlight=false, analyzeQueued=false;
+let analysisRequestId=0;
+
+function setAnalysisError(message){
+  analysisError=message;
+  const stale=!!message && !!(dxState || cmState);
+  $('analysis-error').textContent=message
+    ? `Analysis failed: ${message}${stale?' Previous results are stale.':''}` : '';
+  $('analysis-error').classList.toggle('hide',!message);
+  ['dx','cm','qbody','mis'].forEach(id=>$(id).classList.toggle('analysis-stale',stale));
+}
 
 function scheduleAnalyze(){
   if(analyzeTimer) clearTimeout(analyzeTimer);
   analyzeTimer=setTimeout(runAnalyze, 500);
 }
 async function runAnalyze(){
+  if(!liveTranscriptExtra.trim() && !docText().trim()){
+    // Invalidate pending work before clearing: removed evidence must not
+    // return to the panels through a request that was already in flight.
+    analysisRequestId++;
+    analyzeInFlight=false;analyzeQueued=false;
+    if(analyzeTimer){clearTimeout(analyzeTimer);analyzeTimer=null;}
+    dxState=null;cmState=null;seenConditions=new Set();
+    setAnalysisError(null);
+    ['dx','cm','qbody','mis'].forEach(id=>{
+      $(id).innerHTML='<div class="empty">No evidence is included in this consultation.</div>';
+    });
+    ['dxtag','cmtag','igtag','mistag'].forEach(id=>$(id).textContent='');
+    paintDX();paintCM();paintQB();paintMIS();
+    return;
+  }
   if(analyzeInFlight){ analyzeQueued=true; return; }
-  if(!liveTranscriptExtra && !docText()) return;   // nothing to analyze yet
+  const requestId=++analysisRequestId;
   analyzeInFlight=true;
   // Extraction is a real Sarvam call, typically 15-60s — once the gate is
   // already open, a stale panel with no indication anything is happening
@@ -732,7 +761,10 @@ async function runAnalyze(){
       signal: abort.signal,
     });
     const data=await res.json().catch(()=>null);
-    if(res.ok && data){
+    if(requestId!==analysisRequestId)return;
+    if(!res.ok)throw new Error((data && data.detail)||('HTTP '+res.status));
+    if(!data)throw new Error('Invalid analysis response');
+    {
       // Remember what was on screen BEFORE this repaint, so newly-arrived
       // conditions can be marked rather than the list quietly reshuffling.
       if(dxState && !dxState.stage.abstaining){
@@ -743,28 +775,19 @@ async function runAnalyze(){
       dxState={stage:data};
       cmState={stage:data, tag:'not yet ruled out'};
     }
-    // Either branch repaints from whatever dxState/cmState currently hold.
-    // On success that's the fresh data just assigned above; on a non-2xx
-    // response (fetch() does NOT throw for a 502 -- only a network-level
-    // failure lands in the catch below) it's the last good state, which
-    // is what actually clears the "recalculating…" tags set above. Without
-    // this else, a real /analyze 502 left Can't-Miss/Differential frozen
-    // on "recalculating…" forever — confirmed live 2026-08-22, not
-    // hypothetical: the extraction retry/timeout tightened earlier this
-    // session (max_retries 5->3, timeout 90s->60s) makes a genuinely slow
-    // Sarvam response now surface as a real 502 instead of eventually
-    // succeeding after ~8 minutes, so this path needed to stop lying about
-    // work still being in progress.
+    setAnalysisError(null);
     paintDX(); paintCM(); paintQB(); paintMIS();
   }catch(e){
-    // Network-level failure, OR the abort firing (AbortError) — same
-    // revert either way, nothing new to paint.
+    if(requestId!==analysisRequestId)return;
+    setAnalysisError(e.name==='AbortError'?'request timed out; try again':(e.message||'request failed'));
     paintDX(); paintCM(); paintQB(); paintMIS();
   }
   finally{
     clearTimeout(abortTimer);
-    analyzeInFlight=false;
-    if(analyzeQueued){ analyzeQueued=false; scheduleAnalyze(); }
+    if(requestId===analysisRequestId){
+      analyzeInFlight=false;
+      if(analyzeQueued){ analyzeQueued=false; scheduleAnalyze(); }
+    }
   }
 }
 // The doctor can keep typing and re-commit as many times as they want —
@@ -792,7 +815,10 @@ $('dnote-input').addEventListener('keydown', e=>{
 // anymore. Every panel goes back to its true "nothing captured yet" state.
 function reset(){
   stopQuestionAudio();
+  analysisRequestId++;
+  analyzeInFlight=false;
   dxState=null;cmState=null;
+  setAnalysisError(null);
   committed=false;hasLiveInput=false;
   liveTranscriptExtra='';scannedDocs=[];
   // A new patient inherits nothing: no exclusions someone confirmed about
