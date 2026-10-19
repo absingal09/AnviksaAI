@@ -20,11 +20,14 @@ happens no amount of green output here means the panel is useful. Do not read
 a pass as a safety claim.
 """
 
+import io
 import json
 import re
 import runpy
 import subprocess
 import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -670,6 +673,44 @@ with patch.dict(vocabulary.FINDINGS["headache"], {"label": "Changed label for an
     changed_key = proposal_cache_key()
 check("changing only a finding label invalidates proposal responses", original_key != changed_key)
 check("unchanged finding labels retain the same proposal cache key", original_key == proposal_cache_key())
+
+
+# ===========================================================================
+section("unrated logging contains no consultation evidence")
+import main
+
+with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-unrated-") as log_test_dir:
+    log_path = Path(log_test_dir) / "cache" / "unrated_log.jsonl"
+    request = main.AnalyzeRequest(transcript="PRIVATE_TRANSCRIPT", doc_text="PRIVATE_DOCUMENT")
+    with patch.object(main, "REPO_ROOT", Path(log_test_dir)), \
+            patch.object(main.extract, "extract", return_value=(FINDINGS, {"breathlessness": "PRIVATE_QUOTE"})), \
+            patch.object(main.propose, "propose", return_value=[CANDIDATES[-1]]):
+        logged_payload = main._pipeline(request)
+        records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()] if log_path.exists() else []
+        check("an unrated log line contains only timestamp and condition",
+              len(records) == 1 and set(records[0]) == {"timestamp", "condition"}
+              and records[0]["condition"] == CANDIDATES[-1]["condition"]
+              and "PRIVATE_" not in json.dumps(records), str(records))
+        valid_timestamp = False
+        if records:
+            try:
+                valid_timestamp = datetime.fromisoformat(records[0]["timestamp"]).tzinfo is not None
+            except (KeyError, TypeError, ValueError):
+                pass
+        check("the unrated log timestamp is timezone-aware ISO format", valid_timestamp)
+        main._pipeline(request)
+        records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()] if log_path.exists() else []
+        check("unrated conditions append one private-safe line per analysis",
+              len(records) == 2 and all(set(r) == {"timestamp", "condition"} for r in records))
+        log_error = io.StringIO()
+        with patch.object(Path, "open", side_effect=PermissionError("offline log write failure")), \
+                patch("sys.stderr", log_error):
+            try:
+                failed_log_payload, error = main._pipeline(request), None
+            except Exception as exc:
+                failed_log_payload, error = {}, str(exc)
+        check("a log write failure is reported without hiding the clinical panel",
+              not error and bool(failed_log_payload.get("unrated")) and "log" in log_error.getvalue().lower(), error or log_error.getvalue())
 
 
 # ===========================================================================

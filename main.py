@@ -55,10 +55,12 @@ Usage:
 import argparse
 import asyncio
 import base64
+import json
 import os
 import sys
 import tempfile
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -85,6 +87,24 @@ def get_engine():
     if _engine is None:
         _engine = Engine.load()
     return _engine
+
+
+def _log_unrated(rows):
+    """Record rulebook gaps without any consultation evidence or identifiers."""
+    if not rows:
+        return
+    try:
+        path = REPO_ROOT / "cache" / "unrated_log.jsonl"
+        path.parent.mkdir(exist_ok=True)
+        with path.open("a", encoding="utf-8") as log:
+            for row in rows:
+                log.write(json.dumps({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "condition": row["condition"],
+                }, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        # Losing an operational log must not suppress the clinical panel.
+        print(f"unrated log write failed: {exc}", file=sys.stderr)
 
 
 class AnalyzeRequest(BaseModel):
@@ -210,6 +230,7 @@ def _pipeline(req: AnalyzeRequest):
         confirmed_exclusions=req.confirmed_exclusions,
         asked=req.asked,
     )
+    _log_unrated(payload["unrated"])
     # The quote behind each finding. With no dataset and no eval, a clinician
     # being able to trace a finding back to the words that produced it is a
     # real part of the safety net — and it is how a fabricated finding gets
