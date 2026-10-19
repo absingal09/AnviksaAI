@@ -1,4 +1,4 @@
-"""llm.py — the one place that talks to Sarvam's chat model.
+"""llm.py — task-specific chat models behind one Sarvam credential.
 
 extract.py and propose.py both need the same four things: a client with a
 sane timeout, retry on the transient failures every provider this project
@@ -31,6 +31,8 @@ PROVIDER HISTORY (see git log): Gemini fabricated present findings for
 topics never discussed; Groq's org cap forced the catalog into four batches;
 Sarvam fits the whole thing in one request and is already the provider
 capture.py uses for STT, vision and TTS, so it needs no second credential.
+Current defaults: Gemma 4 screens documents; GLM 5.3 extracts and proposes
+in separate requests. These models use V2; sarvam-105b remains available on V1.
 """
 
 import hashlib
@@ -46,9 +48,34 @@ import httpx
 from sarvamai import SarvamAI
 from sarvamai.core.api_error import ApiError
 
-MODEL = os.environ.get("SARVAM_CHAT_MODEL", "sarvam-105b")
-# Not sarvam-105b-conversations — that variant is tuned for real-time voice
-# turns, not one-shot structured extraction.
+_DEFAULT_MODELS = {"screen": "gemma4", "extract": "glm5.3", "propose": "glm5.3"}
+_V2_MODELS = {"glm5.3", "gemma4", "deepseekv4.1-flash"}
+_V1_MODELS = {"sarvam-105b", "sarvam-105b-conversations"}
+
+
+def config(task):
+    """Independent model profiles; the legacy setting still overrides all defaults."""
+    if task not in _DEFAULT_MODELS:
+        raise ValueError(f"Unknown model task: {task}")
+    model = (os.environ.get(f"SARVAM_{task.upper()}_MODEL")
+             or os.environ.get("SARVAM_CHAT_MODEL") or _DEFAULT_MODELS[task]).strip()
+    if model not in _V1_MODELS | _V2_MODELS:
+        raise ValueError(f"Unsupported Sarvam model for {task}: {model}")
+    reasoning = model in {"glm5.3", "deepseekv4.1-flash"}
+    return {
+        "model": model,
+        "api_version": "v2" if model in _V2_MODELS else "v1",
+        "reasoning_effort": ("low" if task == "screen" else "high") if reasoning else None,
+        # Reasoning and tool arguments share the output budget. Never give a
+        # reasoning model the tiny budget used for direct classification.
+        "max_tokens": (4096 if task == "screen" else 16384) if reasoning
+                      else (256 if task == "screen" else 8192),
+    }
+
+
+def config_key(task):
+    """Everything about model routing/sampling that affects a cached response."""
+    return json.dumps({**config(task), "temperature": 0.0, "seed": 0}, sort_keys=True)
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -64,6 +91,7 @@ def content_hash(*parts):
 
 
 _client = None
+_http_client = None
 
 
 def client():
@@ -76,6 +104,14 @@ def client():
     return _client
 
 
+def http_client():
+    """The installed SDK predates V2; use its documented HTTP API directly."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.Client(timeout=60.0)
+    return _http_client
+
+
 class ToolCallMissing(Exception):
     """A forced-tool-call response came back with no tool_calls anyway.
 
@@ -85,7 +121,7 @@ class ToolCallMissing(Exception):
     as a hard failure on first occurrence."""
 
 
-def call_tool(system_prompt, user_content, tool, *, max_tokens=4096, max_retries=2):
+def call_tool(system_prompt, user_content, tool, *, task="extract", max_tokens=None, max_retries=2):
     """One forced-tool-call round trip. Returns the parsed arguments dict.
 
     Retries on 429/5xx, on network and timeout errors, and on ToolCallMissing.
@@ -108,22 +144,21 @@ def call_tool(system_prompt, user_content, tool, *, max_tokens=4096, max_retries
     proxies cap well below it by default. Vercel and Netlify functions cap
     at 10-60s and cannot host this at all. See render.yaml.
     """
+    settings = config(task)
     delay = 2.0
     for attempt in range(max_retries):
         try:
-            resp = client().chat.completions(
-                model=MODEL,
+            parameters = dict(
+                model=settings["model"],
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 tools=[tool],
                 tool_choice={"type": "function", "function": {"name": tool["function"]["name"]}},
-                # Sarvam defaults to thinking mode, whose tokens share this
-                # output budget. It can exhaust the budget (especially the
-                # short document screen) before emitting any tool arguments.
-                # Send explicit null: omitting the field enables thinking.
-                reasoning_effort=None,
+                # Explicit null disables Sarvam's default thinking mode for
+                # direct models; reasoning models get a separate larger budget.
+                reasoning_effort=settings["reasoning_effort"],
                 temperature=0.0,
                 # The seed moves ONLY on retry. Observed live: with
                 # temperature=0 and a fixed seed, a ToolCallMissing response
@@ -132,25 +167,50 @@ def call_tool(system_prompt, user_content, tool, *, max_tokens=4096, max_retries
                 # times, a guaranteed failure. Attempt 0 keeps seed=0, so a
                 # normal successful call stays reproducible.
                 seed=attempt,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens if max_tokens is not None else settings["max_tokens"],
             )
-            tool_calls = getattr(resp.choices[0].message, "tool_calls", None)
-            if not tool_calls:
+            if settings["api_version"] == "v2":
+                response = http_client().post(
+                    "https://api.sarvam.ai/v2/chat/completions", json=parameters,
+                    headers={"api-subscription-key": os.environ["SARVAM_API_KEY"]},
+                )
+                response.raise_for_status()
+                parsed = response.json()
+            else:
+                parsed = client().chat.completions(**parameters).model_dump()
+            choices = parsed.get("choices") if isinstance(parsed, dict) else None
+            first = choices[0] if isinstance(choices, list) and choices else None
+            message = first.get("message") if isinstance(first, dict) else None
+            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+            if not isinstance(tool_calls, list) or not tool_calls:
                 raise ToolCallMissing("response had no tool_calls despite forced tool_choice")
             # .arguments is a JSON STRING on this SDK (confirmed from the
             # FunctionCall type's `arguments: str` field and a real call),
             # unlike Gemini's already-parsed dict.
-            return json.loads(tool_calls[0].function.arguments)
+            expected_name = tool["function"]["name"]
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                if isinstance(function, dict) and function.get("name") == expected_name:
+                    raw_arguments = function.get("arguments")
+                    if not isinstance(raw_arguments, str):
+                        continue
+                    arguments = json.loads(raw_arguments)
+                    if isinstance(arguments, dict):
+                        return arguments
+            raise ToolCallMissing("response did not return the requested structured object")
 
         # httpx errors arrive UNWRAPPED from the sarvamai SDK's underlying
         # client — they are not ApiError, so an except clause listing only
         # ApiError never caught them and a transient network hiccup failed
         # hard on the first attempt with no retry at all. Observed live,
         # twice in a row, mid-demo.
-        except (ApiError, ToolCallMissing, httpx.TimeoutException, httpx.NetworkError) as e:
-            status = getattr(e, "status_code", None) if isinstance(e, ApiError) else None
+        except (ApiError, ToolCallMissing, json.JSONDecodeError, httpx.HTTPStatusError,
+                httpx.TimeoutException, httpx.NetworkError) as e:
+            status = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else getattr(e, "status_code", None)
             retryable = (
-                isinstance(e, (ToolCallMissing, httpx.TimeoutException, httpx.NetworkError))
+                isinstance(e, (ToolCallMissing, json.JSONDecodeError, httpx.TimeoutException, httpx.NetworkError))
                 or status in (429, 500, 502, 503, 504)
             )
             if retryable and attempt < max_retries - 1:

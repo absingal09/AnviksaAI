@@ -55,7 +55,7 @@ Sarvam captures  ->  LLM reads and proposes  ->  our rulebook triages  ->  clini
 
 | Stage | Owner | What |
 |---|---|---|
-| capture | `capture.py` | `saaras-v3` batch STT (diarized), `sarvam-vision` on documents |
+| capture | `capture.py` | `saaras:v4` batch STT (diarized), `sarvam-vision` on documents |
 | screen | `extract.py` | is this document clinical at all? per document, before anything is merged |
 | extract | `extract.py` | this patient's transcript/documents -> findings, three-valued |
 | propose | `propose.py` | findings -> candidate conditions + what supports/opposes each |
@@ -64,6 +64,37 @@ Sarvam captures  ->  LLM reads and proposes  ->  our rulebook triages  ->  clini
 | speak | `capture.speak()` | the question, translated, in the patient's language |
 
 There is no `api/` package; every module above sits at the repo root.
+
+### Current model routing
+
+One `SARVAM_API_KEY` serves all stages. Screening defaults to `gemma4`;
+extraction and proposal use separate `glm5.3` calls with high reasoning. These
+use Sarvam V2, which requires beta access for the key. The local key was checked.
+`SARVAM_SCREEN_MODEL`, `SARVAM_EXTRACT_MODEL`, `SARVAM_PROPOSE_MODEL` override
+individual stages; the legacy `SARVAM_CHAT_MODEL` overrides defaults for all
+three, with task settings taking precedence. `sarvam-105b` remains available
+through V1 for keys without V2 access. Do not silently fall back on failure.
+The SDK predates V2 chat, so the shared helper uses HTTPX for V2. Both transports
+retain forced tools, temperature zero, initial seed zero, retries and timeouts.
+Reasoning models need a larger output budget because thinking and tool arguments
+share it. Cache keys include the task's full model/sampling profile.
+
+Capture uses `saaras:v4` diarized batch transcription and explicitly pins
+`sarvam-translate:v1`. Speech defaults to `bulbul:v4-flash` with the verified
+`aparna_hi_customer` / `aparna_en_companion` personas for Hindi/English. Other
+existing languages retain v3 pending persona verification; Malayalam and Odia
+have no native v4 personas yet. Never replace another language with an English
+voice. See `.env.example` for STT/translation/TTS overrides. Capture cache keys
+include the selected model and speech settings. Restart after configuration
+changes. OCR and deterministic clinical rules are unchanged.
+
+The existing PE case comparison on 2026-10-19 is documented in README's Models
+section: Gemma/Gemma passed 25/28; GLM/GLM and DeepSeek Flash/DeepSeek Flash each
+passed 27/28. Both left `prior_panic_attacks` unknown instead of expected absent.
+Do not hide this miss by changing the fixture or clinical rules. Compatibility
+checks also covered screening, translation, v4 Hindi/English WAVs and diarized
+v4 STT using synthesized question audio. None is a clinical accuracy evaluation
+or a substitute for real consultations and native-speaker review.
 
 **Screening happens per document and cannot be moved later.** `/analyze`
 concatenates every document into one blob, and after that a game

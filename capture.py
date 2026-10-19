@@ -4,10 +4,10 @@ diarized transcript, a photographed prescription into text, and text into
 spoken audio.
 
 Four functions:
-    transcribe(path)        -> dict            (saaras-v3, batch + diarized)
+    transcribe(path)        -> dict            (saaras-v4, batch + diarized)
     read_image(path)        -> dict            (sarvam-vision / doc_ai)
-    translate(text)         -> str             (sarvam-translate / mayura)
-    speak(text, language)   -> WAV bytes       (bulbul-v3)
+    translate(text)         -> str             (sarvam-translate:v1)
+    speak(text, language)   -> WAV bytes       (bulbul-v4-flash / v3)
 
 Every call is cached to cache/ keyed by a hash of its input, so the same
 audio/image/text is never sent to Sarvam twice — vision is capped at
@@ -41,6 +41,19 @@ CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
 _client = None
+
+# Only switch languages with a documented, verified persona. The remaining
+# languages retain their existing v3 voice; never substitute an English voice.
+_V4_VOICES = {"hi-IN": "aparna_hi_customer", "en-IN": "aparna_en_companion"}
+
+
+def speech_config(language_code, speaker=None):
+    model = os.environ.get("SARVAM_TTS_MODEL", "auto")
+    if model not in {"auto", "bulbul:v3", "bulbul:v4-flash"}:
+        raise ValueError(f"Unsupported speech model: {model}")
+    if model != "bulbul:v3" and language_code in _V4_VOICES:
+        return {"model": "bulbul:v4-flash", "speaker": speaker or _V4_VOICES[language_code]}
+    return {"model": "bulbul:v3", "speaker": speaker or "shubh"}
 
 
 def client():
@@ -77,8 +90,7 @@ def _with_retry(fn, *args, max_retries=5, **kwargs):
 
 # --------------------------------------------------------------------------
 def transcribe(path, language_code="hi-IN", num_speakers=2):
-    """Audio file -> diarized transcript, via saaras-v3 BATCH speech-to-text
-    (CLAUDE.md's actual spec: "saaras-v3 batch STT (diarized)").
+    """Audio file -> diarized transcript, via saaras-v4 BATCH speech-to-text.
 
     Returns a dict shaped like Sarvam's own per-file output JSON:
         {"transcript": "full text",
@@ -103,13 +115,14 @@ def transcribe(path, language_code="hi-IN", num_speakers=2):
     """
     path = Path(path)
     audio_bytes = path.read_bytes()
-    cpath = CACHE_DIR / f"stt_{_hash(audio_bytes, language_code, num_speakers)}.json"
+    model = os.environ.get("SARVAM_STT_MODEL", "saaras:v4")
+    cpath = CACHE_DIR / f"stt_{_hash(model, audio_bytes, language_code, num_speakers, True)}.json"
     if cpath.exists():
         return json.loads(cpath.read_text(encoding="utf-8"))
 
     job = _with_retry(
         client().speech_to_text_job.create_job,
-        model="saaras:v3", language_code=language_code,
+        model=model, language_code=language_code,
         with_diarization=True, num_speakers=num_speakers,
     )
     job.upload_files(file_paths=[str(path)])
@@ -181,8 +194,9 @@ def read_image(path, language="en-IN"):
 
 
 # --------------------------------------------------------------------------
-def speak(text, language_code="hi-IN", speaker="shubh"):
-    """Text -> WAV bytes, via bulbul-v3. Cached by (text, language, speaker).
+def speak(text, language_code="hi-IN", speaker=None):
+    """Text -> WAV bytes, via v4 Flash for Hindi/English, otherwise v3.
+    Cached by text, language, model, voice and output settings.
 
     Returns bytes rather than writing a file: the only caller streams this
     straight to the browser, and a temp file on the way there was pure
@@ -203,13 +217,14 @@ def speak(text, language_code="hi-IN", speaker="shubh"):
        aloud produces an answer that enters the findings pipeline as genuine
        evidence, so it has to be inspectable.
     """
-    key_hash = _hash(text, language_code, speaker)
+    settings = {**speech_config(language_code, speaker), "speech_sample_rate": 24000,
+                "output_audio_codec": "wav", "enable_preprocessing": True}
+    key_hash = _hash(text, language_code, json.dumps(settings, sort_keys=True))
     cpath = CACHE_DIR / f"tts_{key_hash}.wav"
     if not cpath.exists():
         resp = _with_retry(
             client().text_to_speech.convert,
-            text=text, language_code=language_code, speaker=speaker,
-            model="bulbul:v3",
+            text=text, language_code=language_code, **settings,
         )
         audios = getattr(resp, "audios", None) or resp["audios"]
         cpath.write_bytes(base64.b64decode(audios[0]))
@@ -218,15 +233,16 @@ def speak(text, language_code="hi-IN", speaker="shubh"):
 
 # --------------------------------------------------------------------------
 def translate(text, source_language_code="hi-IN", target_language_code="en-IN"):
-    """Text -> translated text, via Sarvam's text.translate (mayura/
-    sarvam-translate). Cached by (text, source, target) same as the other
+    """Text -> translated text, via sarvam-translate:v1.
+    Cached by (model, text, source, target) same as the other
     calls here. Best-effort by convention of every caller of this function,
     not enforced here — returns the translated string or raises, same as
     speak()/transcribe(); it's the CALLER's job to decide a translation
     failure shouldn't fail the whole request (see main.py's usage)."""
     if not text.strip():
         return ""
-    key_hash = _hash(text, source_language_code, target_language_code)
+    model = os.environ.get("SARVAM_TRANSLATION_MODEL", "sarvam-translate:v1")
+    key_hash = _hash(model, text, source_language_code, target_language_code)
     cpath = CACHE_DIR / f"translate_{key_hash}.json"
     if cpath.exists():
         return json.loads(cpath.read_text(encoding="utf-8"))["translated_text"]
@@ -234,7 +250,7 @@ def translate(text, source_language_code="hi-IN", target_language_code="en-IN"):
     resp = _with_retry(
         client().text.translate,
         input=text, source_language_code=source_language_code,
-        target_language_code=target_language_code,
+        target_language_code=target_language_code, model=model,
     )
     translated = getattr(resp, "translated_text", None) or resp["translated_text"]
     cpath.write_text(json.dumps({"translated_text": translated}, ensure_ascii=False),

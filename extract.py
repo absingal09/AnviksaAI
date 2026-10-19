@@ -243,14 +243,14 @@ def screen_document(text):
     if not text:
         return {"clinical": False, "kind": "no readable text"}
 
-    cpath = llm.CACHE_DIR / f"screen_{llm.content_hash(llm.MODEL, _SCREEN_PROMPT, text)}.json"
+    cpath = llm.CACHE_DIR / f"screen_{llm.content_hash(llm.config_key('screen'), _SCREEN_PROMPT, json.dumps(_SCREEN_TOOL, sort_keys=True), text)}.json"
 
     def produce():
         return llm.call_tool(
             _SCREEN_PROMPT,
             f"OCR TEXT FROM ONE IMAGE:\n{text}\n\nCall screen_document.",
             _SCREEN_TOOL,
-            max_tokens=256,
+            task="screen",
         )
 
     try:
@@ -314,7 +314,7 @@ def extract(transcript, doc_text=""):
     # exact transcript that exposed the gap returned the same two findings as
     # before. A stale cache that silently drops findings is the same failure
     # shape as an extractor that misses them.
-    cpath = llm.CACHE_DIR / f"extract_{llm.content_hash(llm.MODEL, _PROMPT_VERSION, transcript, doc_text)}.json"
+    cpath = llm.CACHE_DIR / f"extract_{llm.content_hash(llm.config_key('extract'), _PROMPT_VERSION, transcript, doc_text)}.json"
 
     def produce():
         catalog = vocabulary.catalog_for_prompt()
@@ -327,7 +327,7 @@ def extract(transcript, doc_text=""):
             "Call record_findings. Include a finding only if you can quote the "
             "words that establish it. Leave everything else out."
         )
-        return llm.call_tool(SYSTEM_PROMPT, user_content, _TOOL)
+        return llm.call_tool(SYSTEM_PROMPT, user_content, _TOOL, task="extract")
 
     parsed = llm.cached(cpath, produce)
 

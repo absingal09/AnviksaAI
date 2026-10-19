@@ -250,7 +250,7 @@ def propose(findings):
     if not present:
         return []
 
-    cache_key = llm.content_hash(llm.MODEL, _PROMPT_VERSION, json.dumps(present), json.dumps(absent))
+    cache_key = llm.content_hash(llm.config_key('propose'), _PROMPT_VERSION, json.dumps(present), json.dumps(absent))
     cpath = llm.CACHE_DIR / f"propose_{cache_key}.json"
 
     def produce():
@@ -265,7 +265,7 @@ def propose(findings):
             f"({len(unknown)} of them):\n{render(unknown)}\n\n"
             "Call propose_candidates."
         )
-        return llm.call_tool(SYSTEM_PROMPT, user_content, _TOOL)
+        return llm.call_tool(SYSTEM_PROMPT, user_content, _TOOL, task="propose")
 
     parsed = llm.cached(cpath, produce)
 

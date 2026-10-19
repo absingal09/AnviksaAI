@@ -64,6 +64,13 @@ button:disabled{opacity:.35;cursor:default}
 .empty.locked{color:var(--ink-2);padding:26px 22px;line-height:1.55}
 
 /* ---------- doc scan ---------- */
+.doc-picker{margin-top:9px;padding:12px;border:1px dashed var(--baseline);border-radius:8px;transition:border-color .15s,background .15s}
+.doc-records.dragging,.doc-picker:focus-within{border-color:var(--blue);background:rgba(57,135,229,.08)}
+.doc-records.busy{opacity:.6}
+.doc-picker label{display:block;color:var(--ink-2);font-size:12.5px;margin-bottom:9px;cursor:pointer}
+.doc-picker .controls{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.doc-selection{font-size:11.5px;color:var(--muted);margin-top:7px;overflow-wrap:anywhere}
+.doc-selection:empty{display:none}
 .doc{display:flex;gap:12px;align-items:flex-start;opacity:0;animation:fade .35s ease forwards}
 .thumb{width:56px;height:72px;border-radius:5px;border:1px solid var(--hair);background:linear-gradient(150deg,#33322e,#232320);flex-shrink:0;position:relative;overflow:hidden}
 .thumb::after{content:"";position:absolute;inset:9px 8px;background:repeating-linear-gradient(0deg,var(--muted) 0 1px,transparent 1px 6px);opacity:.5}
@@ -210,7 +217,7 @@ button:disabled{opacity:.35;cursor:default}
     <div class="patient" id="patientbar">—</div>
     <div class="spacer"></div>
     <div class="svc">
-      <span id="s-stt"><i></i>saaras-v3</span>
+      <span id="s-stt"><i></i>transcription</span>
       <span id="s-vis"><i></i>sarvam-vision</span>
     </div>
     <button id="new-consult">New consultation</button>
@@ -224,12 +231,16 @@ button:disabled{opacity:.35;cursor:default}
         <div class="h"><h2>Consultation</h2><span class="tag" id="mode">idle</span></div>
         <div id="tx"><div class="empty">Waiting for consultation to begin.</div></div>
       </div>
-      <div class="card" style="flex:0 0 auto">
+      <div id="doc-drop" class="card doc-records" style="flex:0 0 auto">
         <div class="h"><h2>Patient-supplied records</h2><span class="tag" id="docn">0 scanned</span></div>
         <div id="docs"><div class="empty">No documents scanned.</div></div>
-        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:9px">
-          <input type="file" id="doc-files" multiple accept="image/*,.pdf" style="font-size:12px;min-width:0;max-width:100%;color:var(--muted)">
-          <button type="button" class="primary" id="doc-send" disabled>Scan documents</button>
+        <div class="doc-picker">
+          <label for="doc-files">Drop images or PDFs anywhere in this panel, or choose files</label>
+          <div class="controls">
+            <input type="file" id="doc-files" multiple accept="image/*,.pdf" aria-describedby="doc-selected" style="font-size:12px;min-width:0;max-width:100%;color:var(--muted)">
+            <button type="button" class="primary" id="doc-send" disabled>Scan documents</button>
+          </div>
+          <div id="doc-selected" class="doc-selection" role="status" aria-live="polite"></div>
         </div>
         <div id="doc-result" style="display:none;margin-top:6px"></div>
       </div>
@@ -315,7 +326,7 @@ const ICON_PLAY='<svg viewBox="0 0 16 16" fill="currentColor" style="width:9px;h
 // for what this clinician actually captured, this session.
 // ===================================================================
 
-// bulbul-v3's full TTS voice set — 11 languages, a SUBSET of saaras-v3 STT's
+// Existing Bulbul TTS language set — 11 languages, a SUBSET of Saaras STT's
 // 23 — used only to populate the language dropdown so it can't drift out of
 // sync with what the STT/TTS pipeline actually supports. `native` is used
 // in the header bar; `label` is the dropdown's own display text.
@@ -821,6 +832,7 @@ function reset(){
   setAnalysisError(null);
   committed=false;hasLiveInput=false;
   liveTranscriptExtra='';scannedDocs=[];
+  clearDocSelection();
   // A new patient inherits nothing: no exclusions someone confirmed about
   // someone else, no questions marked as already asked.
   confirmedExclusions=[];askedFindings=[];seenConditions=new Set();
@@ -850,7 +862,7 @@ function paintPatientBar(){
 // language are collected here, before the live view appears — the
 // selected language has to be known up front since it's sent on every
 // live-recording/document-scan call from here on. Dropdown is populated
-// from LANGUAGES only (bulbul-v3/saaras-v3's supported set), not a
+// from LANGUAGES only (the existing shared TTS/STT language set), not a
 // hand-typed <option> list, so it can't drift out of sync.
 (function initSetup(){
   const sel=$('f-lang');
@@ -957,7 +969,7 @@ async function liveSend(){
       e: data.transcript_en ? escHtml(data.transcript_en) : '',
       audioSrc: URL.createObjectURL(liveBlob),
     });
-    svc('s-stt',1); $('mode').textContent='saaras-v3 · codemix · live';
+    svc('s-stt',1); $('mode').textContent='diarized · codemix · live';
     if(data.transcript){
       liveTranscriptExtra += (liveTranscriptExtra?'\n':'') + data.transcript;
       hasLiveInput=true; paintDX(); paintCM();
@@ -989,11 +1001,84 @@ $('live-send').onclick=liveSend;
 // doc_text, so attributing a finding to one particular document would mean
 // inventing an attribution nothing actually established.
 // ===================================================================
-let docFiles=[];
-$('doc-files').onchange=()=>{
-  docFiles=Array.from($('doc-files').files);
+let docFiles=[], docScanInFlight=false;
+function clearDocSelection(){
+  docFiles=[];
+  $('doc-files').value='';
+  $('doc-selected').textContent='';
+  $('doc-drop').classList.remove('dragging');
+  $('doc-send').disabled=true;
+}
+function selectDocFiles(files, append=false){
+  if(docScanInFlight) return;
+  const selected=Array.from(files || []);
+  const supported=f=>(f.type || '').startsWith('image/') || f.type==='application/pdf'
+    || /\.(pdf|png|jpe?g|gif|webp|bmp|tiff?|heic|heif|avif|svg|ico)$/i.test(f.name || '');
+  const accepted=selected.filter(supported);
+  if(append){
+    accepted.forEach(file=>{
+      if(!docFiles.some(existing=>existing.name===file.name && existing.size===file.size
+        && existing.lastModified===file.lastModified && existing.type===file.type))docFiles.push(file);
+    });
+  }else{
+    docFiles=accepted;
+  }
+  const skipped=selected.filter(f=>!supported(f));
+  $('doc-selected').textContent=(docFiles.length
+    ? `${docFiles.length} file${docFiles.length===1?'':'s'} selected: ${docFiles.map(f=>f.name).join(', ')}. Drop more to add, or click Scan documents to upload.`
+    : '')+(skipped.length ? ` Unsupported files skipped: ${skipped.map(f=>f.name).join(', ')}. Choose images or PDFs.` : '');
   $('doc-send').disabled=docFiles.length===0;
+}
+$('doc-files').onchange=()=>selectDocFiles($('doc-files').files);
+function withinDocDrop(e){
+  const panel=$('doc-drop'), rect=panel.getBoundingClientRect();
+  return panel.contains(e.target) && rect.width>0 && rect.height>0
+    && e.clientX>=rect.left && e.clientX<rect.right
+    && e.clientY>=rect.top && e.clientY<rect.bottom;
+}
+function updateDocDrag(e){
+  if(!isFileDrag(e))return;
+  e.preventDefault();
+  const allowed=!docScanInFlight && withinDocDrop(e);
+  $('doc-drop').classList.toggle('dragging',allowed);
+  e.dataTransfer.dropEffect=allowed?'copy':'none';
+}
+$('doc-drop').ondragenter=updateDocDrag;
+$('doc-drop').ondragover=updateDocDrag;
+$('doc-drop').ondragleave=e=>{
+  e.preventDefault();
+  if(!$('doc-drop').contains(e.relatedTarget))$('doc-drop').classList.remove('dragging');
 };
+function acceptDocDrop(e){
+  e.preventDefault();
+  $('doc-drop').classList.remove('dragging');
+  if(!withinDocDrop(e))return;
+  const files=Array.from(e.dataTransfer?.files || []);
+  if(docScanInFlight || !files.length)return;
+  $('doc-files').value='';
+  selectDocFiles(files,true);
+}
+$('doc-drop').ondrop=e=>{
+  if(!e.defaultPrevented)acceptDocDrop(e);
+};
+
+// Handle file drags in capture phase, before a nested native control or other
+// handler can consume them. Only the records panel accepts files. Everywhere
+// else, cancel browser file navigation without changing selection or status.
+function isFileDrag(e){
+  return Array.from(e.dataTransfer?.types || []).includes('Files')
+    || !!e.dataTransfer?.files?.length;
+}
+document.addEventListener('dragenter',updateDocDrag,true);
+document.addEventListener('dragover',updateDocDrag,true);
+document.addEventListener('drop',e=>{
+  if(!isFileDrag(e))return;
+  acceptDocDrop(e);
+},true);
+document.addEventListener('dragleave',e=>{
+  if(!e.relatedTarget)$('doc-drop').classList.remove('dragging');
+},true);
+document.addEventListener('dragend',()=>$('doc-drop').classList.remove('dragging'),true);
 
 // Full extracted text lives in the modal; the row stays thumbnail +
 // filename + char count so a stack of records is still skimmable.
@@ -1056,7 +1141,11 @@ function renderScannedDocs(){
 }
 
 async function docSend(){
-  if(!docFiles.length) return;
+  if(!docFiles.length || docScanInFlight) return;
+  docScanInFlight=true;
+  $('doc-files').disabled=true;
+  $('doc-drop').classList.add('busy');
+  $('doc-drop').classList.remove('dragging');
   const btn=$('doc-send');
   btn.disabled=true;
   const prevText=btn.textContent;
@@ -1089,11 +1178,11 @@ async function docSend(){
   }catch(e){
     $('doc-result').textContent='Document scan failed: '+e.message;
   }finally{
-    btn.disabled=false;
+    docScanInFlight=false;
+    $('doc-files').disabled=false;
+    $('doc-drop').classList.remove('busy');
     btn.textContent=prevText;
-    docFiles=[];
-    $('doc-files').value='';
-    $('doc-send').disabled=true;
+    clearDocSelection();
   }
 }
 $('doc-send').onclick=docSend;
