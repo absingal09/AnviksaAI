@@ -384,6 +384,29 @@ check("an excluded condition no longer drives the next question",
       after["next_question"] is None
       or "Pulmonary embolism" not in after["next_question"]["divides"])
 
+renamed_pe = dict(CANDIDATES[0], condition="Acute pulmonary embolism")
+renamed_exclusion = eng.assess([renamed_pe], FINDINGS,
+                              confirmed_exclusions=["Pulmonary embolism"])
+check("a confirmed exclusion covers severity-matched naming variants",
+      not renamed_exclusion["cant_miss"] and len(renamed_exclusion["ruled_out"]) == 1)
+check("an excluded naming variant does not drive the next question",
+      renamed_exclusion["next_question"] is None)
+reverse_exclusion = eng.assess([CANDIDATES[0]], FINDINGS,
+                              confirmed_exclusions=["Acute pulmonary embolism"])
+check("confirmation under a variant also excludes the canonical name",
+      not reverse_exclusion["cant_miss"] and len(reverse_exclusion["ruled_out"]) == 1)
+missing_proposal = eng.assess([CANDIDATES[1]], FINDINGS,
+                             confirmed_exclusions=["Pulmonary embolism"])
+check("a confirmed exclusion stays auditable when no longer proposed",
+      any(r["condition"] == "Pulmonary embolism" and r["reasoning"]
+          for r in missing_proposal["ruled_out"]))
+audit_only = eng.assess([], FINDINGS, confirmed_exclusions=["Pulmonary embolism"])
+check("an audit-only consultation still shows its confirmed exclusions",
+      not audit_only["abstaining"] and len(audit_only["ruled_out"]) == 1
+      and not audit_only["cant_miss"] and audit_only["next_question"] is None)
+check("a naming variant without clinician confirmation stays open",
+      len(eng.assess([renamed_pe], FINDINGS)["cant_miss"]) == 1)
+
 
 # ===========================================================================
 section("abstain visibly; fabricate nothing")
