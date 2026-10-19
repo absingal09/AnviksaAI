@@ -40,6 +40,7 @@ import json
 
 import llm
 import vocabulary
+from propose import _UNSUPPORTED_REASONING
 
 SYSTEM_PROMPT = """You are a clinical scribe. You read a consultation \
 transcript and any documents the patient brought, and you record which \
@@ -71,7 +72,14 @@ calf, a recent flight. Record only what is in the text. You do not know what \
 condition anyone is considering, and that is deliberate.
 
 RULES
-- Use ONLY ids that appear in the catalog. Never invent an id.
+- For present and absent, use ONLY ids that appear in the catalog. Never invent an id.
+- Use a catalog id whenever one fits. Use `other` ONLY for clinically relevant \
+present statements that no catalog finding covers. Never put a denial, an \
+absence, an unknown, or a hypothetical in `other`. Return at most ten entries, \
+each a short clinical phrase in English of at most twelve words, with a quote \
+copied from the transcript or documents. Do not write percentages, probability, \
+likelihood, confidence, or "chance of" claims in the phrase. Keep the evidence \
+quote verbatim, including any numbers or percentages the source contains.
 - Documents count as evidence. A photographed prescription or blister strip \
 naming a drug establishes that the patient takes that drug, even if they \
 never said so out loud. Read the drug name and map it to the right finding \
@@ -153,8 +161,21 @@ _TOOL = {
                         "required": ["id", "evidence"],
                     },
                 },
+                "other": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "description": "Present clinical statements not covered by any catalog finding; never denials or absences.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "Short clinical phrase in English, at most twelve words. Use a catalog id instead whenever one fits."},
+                            "evidence": {"type": "string", "description": "Verbatim quote copied from the transcript or documents."},
+                        },
+                        "required": ["text", "evidence"],
+                    },
+                },
             },
-            "required": ["present", "absent"],
+            "required": ["present", "absent", "other"],
         },
     },
 }
@@ -294,7 +315,41 @@ def _flatten(transcript):
     return transcript or ""
 
 
-def extract(transcript, doc_text=""):
+def _normalise_quote(text):
+    return " ".join(text.casefold().split())
+
+
+def _other_findings(items, sources):
+    """Validate a separate positive-evidence channel; never create catalog IDs.
+
+    The shared proposal regex checks model-written text only. Source quotes
+    retain doses, durations and percentages exactly as supplied.
+    """
+    if not isinstance(items, list):
+        return []
+    other = []
+    for item in items:
+        text = item.get("text") if isinstance(item, dict) else None
+        evidence = item.get("evidence") if isinstance(item, dict) else None
+        text = " ".join(text.split()) if isinstance(text, str) else ""
+        reason = None
+        if not text or len(text.split()) > 12:
+            reason = "missing text or more than twelve words"
+        elif _UNSUPPORTED_REASONING.search(text):
+            reason = "probability wording in generated text"
+        elif not isinstance(evidence, str) or not evidence.strip() or not any(
+                _normalise_quote(evidence) in source for source in sources):
+            reason = "evidence quote not found verbatim in source"
+        elif len(other) >= 10:
+            reason = "more than ten entries"
+        if reason:
+            print(f"extract: dropped other {text or '<malformed>'!r}: {reason}")
+            continue
+        other.append({"id": f"other:{len(other)}", "text": text, "evidence": evidence.strip()})
+    return other
+
+
+def extract(transcript, doc_text="", *, include_other=False):
     """-> ({finding_id: True|False}, {finding_id: "quoted evidence"})
 
     The second return value is the quote that justifies each finding. It is
@@ -302,6 +357,10 @@ def extract(transcript, doc_text=""):
     trace a finding back to the words that produced it is a real part of the
     safety net. It is also how a fabricated finding gets caught — a model
     that cannot quote anything for a finding it recorded has invented it.
+
+    With include_other=True, return (findings, quotes, other_findings).
+    The default pair remains compatible with existing catalog-only callers.
+    Supplemental IDs are ephemeral and must never enter catalog state.
     """
     transcript = _flatten(transcript)
     doc_text = doc_text or ""
@@ -310,7 +369,7 @@ def extract(transcript, doc_text=""):
     # model to find findings in an empty string — it costs money, takes
     # seconds, and invites invention.
     if not transcript.strip() and not doc_text.strip():
-        return {}, {}
+        return ({}, {}, []) if include_other else ({}, {})
 
     # The cache key covers EVERYTHING that determines the answer, not just the
     # patient's words. Keying on (model, transcript, doc_text) alone meant
@@ -338,7 +397,7 @@ def extract(transcript, doc_text=""):
     parsed = llm.cached(cpath, produce)
 
     if not isinstance(parsed, dict):
-        return {}, {}
+        return ({}, {}, []) if include_other else ({}, {})
     findings, quotes, dropped = {}, {}, []
     recorded_states = {}
     for state, key in ((True, "present"), (False, "absent")):
@@ -373,7 +432,12 @@ def extract(transcript, doc_text=""):
     if dropped:
         print(f"extract: dropped {len(dropped)} id(s) not in findings.yaml: {sorted(set(dropped))}")
 
-    return findings, quotes
+    sources = [_normalise_quote(transcript), _normalise_quote(doc_text)]
+    mismatches = sum(not any(_normalise_quote(quote) in source for source in sources)
+                     for quote in quotes.values())
+    print(f"extract: catalog evidence quote mismatches: {mismatches}")
+    other = _other_findings(parsed.get("other"), sources)
+    return (findings, quotes, other) if include_other else (findings, quotes)
 
 
 if __name__ == "__main__":

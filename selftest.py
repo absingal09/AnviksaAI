@@ -653,6 +653,72 @@ check("malformed screening output keeps the document visibly unscreened",
 
 
 # ===========================================================================
+section("supplemental findings have source-backed quotes and stay separate")
+
+
+def extracted_other(response, transcript="My eyelid keeps twitching.", document=""):
+    output = io.StringIO()
+    with patch.object(llm, "cached", return_value=response), patch("sys.stdout", output):
+        result = extract.extract(transcript, document, include_other=True)
+    return result, output.getvalue()
+
+
+supplemental_response = {"present": [], "absent": [], "other": [
+    {"text": "Eyelid twitching", "evidence": "My eyelid keeps twitching."},
+]}
+supplemental, supplemental_log = extracted_other(supplemental_response)
+check("a verbatim supplemental quote is kept outside the catalog dict and quotes",
+      supplemental == ({}, {}, [{"id": "other:0", "text": "Eyelid twitching",
+                                "evidence": "My eyelid keeps twitching."}]))
+check("the supplemental schema caps entries and requires text and quoted evidence",
+      extract._TOOL["function"]["parameters"]["properties"]["other"]["maxItems"] == 10
+      and extract._TOOL["function"]["parameters"]["properties"]["other"]["items"]["required"] == ["text", "evidence"]
+      and "Never put a denial" in extract.SYSTEM_PROMPT)
+normalised, _ = extracted_other({"other": [{"text": "Eyelid twitching", "evidence": "MY eyelid\nkeeps twitching."}]},
+                                 document="My  eyelid keeps\t twitching.", transcript="")
+check("supplemental quote verification normalises only whitespace and case and reads documents",
+      len(normalised[2]) == 1 and normalised[2][0]["evidence"] == "MY eyelid\nkeeps twitching.")
+unquoted, unquoted_log = extracted_other({"other": [{"text": "Eyelid twitching", "evidence": "Her eyelid twitches."}]})
+check("a paraphrased supplemental quote is dropped and its generated text is logged",
+      unquoted[2] == [] and "Eyelid twitching" in unquoted_log and "not found verbatim" in unquoted_log)
+cross_source, _ = extracted_other({"other": [{"text": "Eyelid twitching", "evidence": "eyelid twitching"}]},
+                                  transcript="eyelid", document="twitching")
+check("a supplemental quote cannot be assembled across transcript and document boundaries", cross_source[2] == [])
+for unsafe in ["95% chance of eyelid twitching", "Probability of twitching", "High likelihood",
+               "High confidence", "A chance of twitching", "Ten percent", "P(twitching)"]:
+    rejected, rejection_log = extracted_other({"other": [{"text": unsafe, "evidence": "My eyelid keeps twitching."}]})
+    check(f"supplemental generated probability wording is dropped and logged: {unsafe}",
+          rejected[2] == [] and unsafe in rejection_log and "probability wording" in rejection_log)
+numeric_source = "My eyelid twitches 5 times; a note says 95% probability."
+numeric_other, _ = extracted_other({"other": [{"text": "Eyelid twitches 5 times", "evidence": numeric_source}]},
+                                   transcript=numeric_source)
+check("digits in supplemental text and probability wording in verbatim quotes are retained",
+      numeric_other[2] == [{"id": "other:0", "text": "Eyelid twitches 5 times", "evidence": numeric_source}])
+malformed_other, malformed_log = extracted_other({"other": [None, {}, {"text": 9, "evidence": []},
+    {"text": " ", "evidence": "My eyelid keeps twitching."},
+    {"text": " ".join(["word"] * 13), "evidence": "My eyelid keeps twitching."},
+    supplemental_response["other"][0]]})
+check("malformed and overlong supplemental entries do not crash or displace valid entries",
+      malformed_other[2] == supplemental[2] and "dropped other" in malformed_log)
+capped_other, capped_log = extracted_other({"other": [dict(supplemental_response["other"][0], text=f"Eyelid twitching {n}")
+                                                       for n in range(11)]})
+check("supplemental entries are capped in code with ephemeral IDs and excess entries are logged",
+      len(capped_other[2]) == 10 and capped_other[2][-1]["id"] == "other:9"
+      and "Eyelid twitching 10" in capped_log)
+catalog_mismatch, mismatch_log = extracted_other({"present": [{"id": "fever", "evidence": "unmatched quote"}]})
+check("catalog quote mismatches are counted but existing findings and quotes are retained",
+      catalog_mismatch[:2] == ({"fever": True}, {"fever": "unmatched quote"})
+      and "catalog evidence quote mismatches: 1" in mismatch_log)
+check("empty extended extraction still abstains offline", extract.extract("", include_other=True) == ({}, {}, []))
+check("new extraction schema and prompt participate in the cache version",
+      extract._PROMPT_VERSION == llm.content_hash(extract.SYSTEM_PROMPT, json.dumps(extract._TOOL, sort_keys=True),
+          json.dumps(vocabulary.catalog_for_prompt(), sort_keys=True, ensure_ascii=False))
+      and extract._PROMPT_VERSION != llm.content_hash(extract.SYSTEM_PROMPT,
+          json.dumps({"without": "other"}, sort_keys=True),
+          json.dumps(vocabulary.catalog_for_prompt(), sort_keys=True, ensure_ascii=False)))
+
+
+# ===========================================================================
 section("candidate reasoning does not invent certainty")
 withheld_reasoning = "Reasoning withheld: the model used numeric or probability wording."
 
