@@ -168,6 +168,7 @@ button:disabled{opacity:.35;cursor:default}
 .hint{font-size:11.5px;color:var(--muted);text-align:center;flex-shrink:0}
 .analysis-error{padding:10px 14px;border:1px solid var(--warning);border-radius:7px;color:var(--warning);background:var(--surface);flex-shrink:0}
 .analysis-stale{opacity:.65}
+.other-quote{margin:6px 0 10px;padding-left:9px;border-left:2px solid var(--baseline);font-size:11px;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere}
 .hide{display:none}
 @media(max-width:1180px){.cols{grid-template-columns:1fr}.app{height:auto}.card.scroll,.card{max-height:none!important}}
 
@@ -279,6 +280,10 @@ button:disabled{opacity:.35;cursor:default}
       <div class="card scroll" style="flex:0 0 auto;max-height:34%">
         <div class="h"><h2>Doesn't fit</h2><span class="tag" id="mistag"></span></div>
         <div id="mis"><div class="empty">—</div></div>
+      </div>
+      <div class="card scroll hide" id="other-card" style="flex:0 0 auto;max-height:26%">
+        <div class="h"><h2>Also noted, outside the standard list</h2></div>
+        <div id="other-findings"></div>
       </div>
     </div>
 
@@ -469,6 +474,7 @@ const GATE_MSG=`<div class="empty locked">Waiting for a live recording or docume
 // silently goes blank, which reads as broken rather than as a deliberate
 // refusal to guess. Each paint function below says so in words instead.
 function paintDX(){
+  paintOtherFindings();
   if(!committed || !hasLiveInput){ $('dx').innerHTML=GATE_MSG; $('dxtag').textContent=''; return; }
   // Gate open but no /analyze has ever completed yet (still in flight, or
   // one aborted before any prior success) — clear the tag rather than
@@ -575,7 +581,8 @@ function wireExclusionButtons(){
 function paintQB(){
   if(!committed || !hasLiveInput){ $('qbody').innerHTML=GATE_MSG; $('igtag').textContent=''; return; }
   if(!dxState){ $('igtag').textContent=''; return; }
-  const s=dxState.stage, q=s.next_question;
+  const s=dxState.stage;
+  const q=s.next_question && !/^other:/i.test(s.next_question.finding) ? s.next_question : null;
   $('igtag').textContent='';
   // Abstaining means there is nothing behind a question either. The old
   // build showed one anyway — an irrelevant image still produced a
@@ -655,6 +662,16 @@ async function speakQuestion(q){
   }
 }
 
+function paintOtherFindings(){
+  const items=dxState ? (dxState.stage.other_findings||[]) : [];
+  const visible=committed && hasLiveInput && items.length>0;
+  $('other-card').classList.toggle('hide',!visible);
+  // IDs are request-local support references, never display labels or state.
+  $('other-findings').innerHTML=visible ? items.map(item=>
+    `<div class="why"><b>${esc(item.text)}</b></div><blockquote class="other-quote">${esc(item.evidence)}</blockquote>`
+  ).join('') : '';
+}
+
 function paintMIS(){
   if(!committed || !hasLiveInput){ $('mis').innerHTML=GATE_MSG; $('mistag').textContent=''; return; }
   if(!dxState) return;
@@ -701,7 +718,7 @@ function setAnalysisError(message){
   $('analysis-error').textContent=message
     ? `Analysis failed: ${message}${stale?' Previous results are stale.':''}` : '';
   $('analysis-error').classList.toggle('hide',!message);
-  ['dx','cm','qbody','mis'].forEach(id=>$(id).classList.toggle('analysis-stale',stale));
+  ['dx','cm','qbody','mis','other-findings'].forEach(id=>$(id).classList.toggle('analysis-stale',stale));
 }
 
 function scheduleAnalyze(){
@@ -767,7 +784,7 @@ async function runAnalyze(){
         transcript: liveTranscriptExtra,
         doc_text: docText(),
         confirmed_exclusions: confirmedExclusions,
-        asked: askedFindings,
+        asked: askedFindings.filter(fid=>!/^other:/i.test(fid)),
       }),
       signal: abort.signal,
     });
@@ -831,6 +848,7 @@ function reset(){
   dxState=null;cmState=null;
   setAnalysisError(null);
   committed=false;hasLiveInput=false;
+  paintOtherFindings();
   liveTranscriptExtra='';scannedDocs=[];
   clearDocSelection();
   // A new patient inherits nothing: no exclusions someone confirmed about

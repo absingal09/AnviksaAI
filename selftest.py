@@ -1365,7 +1365,7 @@ with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-unrated-")
     log_path = Path(log_test_dir) / "cache" / "unrated_log.jsonl"
     request = main.AnalyzeRequest(transcript="PRIVATE_TRANSCRIPT", doc_text="PRIVATE_DOCUMENT")
     with patch.object(main, "REPO_ROOT", Path(log_test_dir)), \
-            patch.object(main.extract, "extract", return_value=(FINDINGS, {"breathlessness": "PRIVATE_QUOTE"})), \
+            patch.object(main.extract, "extract", return_value=(FINDINGS, {"breathlessness": "PRIVATE_QUOTE"}, [])), \
             patch.object(main.propose, "propose", return_value=[CANDIDATES[-1]]):
         logged_payload = main._pipeline(request)
         records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()] if log_path.exists() else []
@@ -1393,6 +1393,137 @@ with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-unrated-")
                 failed_log_payload, error = {}, str(exc)
         check("a log write failure is reported without hiding the clinical panel",
               not error and bool(failed_log_payload.get("unrated")) and "log" in log_error.getvalue().lower(), error or log_error.getvalue())
+
+
+# ===========================================================================
+section("supplemental evidence reaches the API and escaped clinician panels")
+
+
+async def exercise_supplemental_pipeline():
+    source = "My eyelid twitches <b>x</b> 5 times; SOURCE_ONLY 95% probability."
+    phrase = "Eyelid twitching <b>x</b> 5 times"
+    proposed_inputs, extraction_keys, assessment_calls = [], [], []
+    invalid_quote = False
+
+    def response(system, user, tool, *, task):
+        if task == "extract":
+            return {"present": [], "absent": [], "other": [{
+                "text": phrase if not invalid_quote else "Unquoted twitching",
+                "evidence": source if not invalid_quote else "This was never said.",
+            }]}
+        if task != "propose":
+            raise AssertionError("Unexpected model task in offline test")
+        proposed_inputs.append(user)
+        return {"candidates": [{
+            "condition": "Eyelid myokymia",
+            "reasoning": "other:0 was reported. A 95% chance of recovery.",
+            "supported_by": ["other:0", "other:99"], "opposed_by": ["other:0"],
+            "unresolved": ["other:0", "calf_swelling_unilateral"],
+        }]}
+
+    def cached(path, produce):
+        extraction_keys.append(str(path))
+        return produce()
+
+    original_assess = eng.assess
+
+    def assess(*args, **kwargs):
+        assessment_calls.append((args, kwargs))
+        return original_assess(*args, **kwargs)
+
+    logs = io.StringIO()
+    with patch.object(llm, "cached", side_effect=cached), patch.object(llm, "call_tool", side_effect=response), \
+            patch.object(main, "get_engine", return_value=eng), patch.object(eng, "assess", side_effect=assess), \
+            patch.object(main, "_log_unrated"), patch("sys.stdout", logs):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+            result = await client.post("/analyze", json={"doc_text": source, "asked": ["other:0", "calf_swelling_unilateral"]})
+            invalid_quote = True
+            rejected = await client.post("/analyze", json={"transcript": source})
+    return result, rejected, proposed_inputs, assessment_calls, logs.getvalue(), source, phrase
+
+
+api_other, api_rejected, api_proposal_inputs, api_assessments, api_other_log, api_source, api_phrase = asyncio.run(exercise_supplemental_pipeline())
+api_payload = api_other.json()
+check("analyze returns validated supplemental evidence with its verbatim numeric quote",
+      api_other.status_code == 200
+      and api_payload["other_findings"] == [{"id": "other:0", "text": api_phrase, "evidence": api_source}])
+check("an other-only consultation reaches proposal and returns candidates without abstaining",
+      len(api_proposal_inputs) == 1 and not api_payload["abstaining"] and bool(api_payload["unrated"])
+      and api_payload["_findings"] == api_payload["_quotes"] == {}
+      and "SOURCE_ONLY" not in api_proposal_inputs[0] and api_source not in api_proposal_inputs[0])
+check("analyze passes only catalog ids into asked tracking and no supplemental exclusion state",
+      api_assessments[0][1]["asked"] == ["calf_swelling_unilateral"]
+      and api_assessments[0][1]["confirmed_exclusions"] == []
+      and api_assessments[0][0][1] == {} and api_payload["next_question"] is None
+      and api_payload["findings_present"] == api_payload["findings_absent"] == [])
+check("an unquoted supplemental claim is omitted from the API and logged without proposing from it",
+      api_rejected.status_code == 200 and api_rejected.json()["other_findings"] == []
+      and api_rejected.json()["abstaining"] and "Unquoted twitching" in api_other_log)
+generated_other = [api_payload["other_findings"][0]["text"], api_payload["unrated"][0]["reasoning"],
+                   api_payload["unrated"][0]["supported_by"][0]["label"]]
+check("supplemental generated text contains no percentages or probability wording while quotes remain untouched",
+      all(not propose._UNSUPPORTED_REASONING.search(value) for value in generated_other)
+      and "95% probability" in api_payload["other_findings"][0]["evidence"]
+      and "5" in api_payload["other_findings"][0]["text"])
+
+# Load definitions only: never invoke run_cases.main() or any live case.
+case_helpers = runpy.run_path(str(ROOT / "run_cases.py"), run_name="offline_case_helpers")
+number_issues = case_helpers["number_issues"]
+check("manual case checks ignore internal ids and verbatim evidence but permit ordinary clinical digits",
+      not number_issues(api_payload)
+      and not number_issues({"id": "other:95", "finding": "other:95", "evidence": "95% probability", "text": "Twitches 5 times"}))
+for field, value in [("label", "95%"), ("reasoning", "A chance of recovery"),
+                     ("note", "High confidence"), ("text", "High probability"),
+                     ("note", "Risk score 95"), ("score", 5), ("weight", 0.5)]:
+    check(f"manual case checks still inspect generated {field}: {value}", bool(number_issues({field: value})))
+
+try:
+    browser_result = browser_checks(r"""
+const payload = PAYLOAD;
+run('committed=false;hasLiveInput=true;');context.payload=payload;
+run('dxState={stage:payload};cmState={stage:payload};paintDX();');
+results.hidden_without_note=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+run('committed=true;hasLiveInput=false;paintDX();');
+results.hidden_without_input=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+run('committed=true;hasLiveInput=true;paintDX();paintCM();paintQB();paintMIS();');
+const html=elements.get('other-findings').innerHTML;
+results.visible_and_escaped=!elements.get('other-card').classList.contains('hide')
+  && (html.match(/&lt;b&gt;x&lt;\/b&gt;/g)||[]).length===2 && !html.includes('<b>x</b>')
+  && html.includes('5 times') && html.includes('95% probability');
+results.support_label=elements.get('dx').innerHTML.includes('Eyelid twitching &lt;b&gt;x&lt;/b&gt; 5 times');
+results.no_displayed_ids=[...elements.values()].every(el=>!el.innerHTML.includes('other:') && !el.textContent.includes('other:'));
+run('setAnalysisError("offline failure")');
+results.stale=elements.get('other-findings').classList.contains('analysis-stale');
+run(`dxState.stage.next_question={finding:'other:0',ask:'other:0'};paintQB();`);
+results.no_supplemental_question=!elements.get('qbody').innerHTML.includes('other:') && run('askedFindings.length===0');
+let sent;
+context.fetch=async(url,options)=>{sent=JSON.parse(options.body);return {ok:true,json:async()=>payload};};
+run(`askedFindings=['other:0','calf_swelling_unilateral'];liveTranscriptExtra='My eyelid twitches.';`);
+await run('runAnalyze()');
+results.no_supplemental_asked=JSON.stringify(sent.asked)===JSON.stringify(['calf_swelling_unilateral']);
+run("scannedDocs=[];liveTranscriptExtra='';");await run('runAnalyze()');
+results.cleared_without_evidence=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+run('dxState={stage:payload};paintDX();reset();');
+results.reset_clears=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+""".replace("PAYLOAD", json.dumps(api_payload)))
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+check("the supplemental section has an explicit outside-the-standard-list label",
+      "Also noted, outside the standard list" in (ROOT / "web/index.html").read_text(encoding="utf-8"))
+for key, description in [
+    ("hidden_without_note", "supplemental evidence stays hidden until the clinician note is committed"),
+    ("hidden_without_input", "supplemental evidence stays hidden without real input"),
+    ("visible_and_escaped", "supplemental text and verbatim quotes both escape HTML while retaining clinical numbers"),
+    ("support_label", "candidate support rows show the supplemental text"),
+    ("no_displayed_ids", "other: never appears anywhere in the rendered page"),
+    ("stale", "failed analysis marks supplemental evidence as stale with the other panels"),
+    ("no_supplemental_question", "even a malformed supplemental question cannot render or enter asked tracking"),
+    ("no_supplemental_asked", "analysis requests omit supplemental ids from asked tracking"),
+    ("cleared_without_evidence", "removing all evidence clears the supplemental section"),
+    ("reset_clears", "reset clears supplemental evidence"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
 
 
 # ===========================================================================

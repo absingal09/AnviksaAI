@@ -228,12 +228,13 @@ def _pipeline(req: AnalyzeRequest):
     Confirmed live — the third of three sequential requests got
     ERR_CONNECTION_REFUSED while the second was still blocking.
     """
-    findings, quotes = extract.extract(req.transcript, req.doc_text)
-    candidates = propose.propose(findings)
+    findings, quotes, other = extract.extract(req.transcript, req.doc_text, include_other=True)
+    candidates = propose.propose(findings, other)
     payload = get_engine().assess(
         candidates, findings,
         confirmed_exclusions=req.confirmed_exclusions,
-        asked=req.asked,
+        asked=[fid for fid in req.asked if fid in vocabulary.FINDINGS],
+        other_findings=other,
     )
     _log_unrated(payload["unrated"])
     # The quote behind each finding. With no dataset and no eval, a clinician
@@ -242,6 +243,7 @@ def _pipeline(req: AnalyzeRequest):
     # caught.
     payload["_findings"] = findings
     payload["_quotes"] = quotes
+    payload["other_findings"] = other
     return payload
 
 
