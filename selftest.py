@@ -501,6 +501,22 @@ check("malformed screening output keeps the document visibly unscreened",
 
 
 # ===========================================================================
+section("candidate reasoning does not invent certainty")
+for unsafe_reasoning in ["A 95% chance of PE", "The probability of PE is high.",
+                         "There is a chance of PE.", "Ninety-five percent certainty.",
+                         "P(PE) = 0.95.", "The likelihood of PE is high."]:
+    response = {"candidates": [dict(CANDIDATES[0], reasoning=unsafe_reasoning), CANDIDATES[1]]}
+    with patch.object(propose.llm, "cached", return_value=response):
+        checked_candidates = propose.propose(FINDINGS)
+    check(f"unsafe reasoning is rejected: {unsafe_reasoning}",
+          [c["condition"] for c in checked_candidates] == ["Panic attack"])
+with patch.object(propose.llm, "cached", return_value={"candidates": [CANDIDATES[0]]}):
+    checked_candidates = propose.propose(FINDINGS)
+check("factual candidate reasoning survives validation",
+      len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] == CANDIDATES[0]["reasoning"])
+
+
+# ===========================================================================
 section("determinism — identical input, identical output")
 # ===========================================================================
 # Confirmed live once: identical input returned different findings run to run

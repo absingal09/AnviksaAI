@@ -43,9 +43,16 @@ reasoning below is the safety net, which is why every candidate must carry it.
 """
 
 import json
+import re
 
 import llm
 import vocabulary
+
+_UNSUPPORTED_REASONING = re.compile(
+    r"[%％]|\b(?:percent(?:age)?|per\s+cent|probabilit(?:y|ies)|likelihood|confidence)\b"
+    r"|\bchance\s+of\b|\bp\s*(?:=|\()",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = """You are helping a clinician in a two-minute outpatient \
 consultation remember what is worth not forgetting.
@@ -270,6 +277,11 @@ def propose(findings):
         # itself cannot be checked by the clinician, and the clinician is the
         # entire safety net — so it does not reach the panel at all.
         if not condition or not reasoning:
+            continue
+        if _UNSUPPORTED_REASONING.search(reasoning):
+            # Prompts cannot enforce this product rule. Validate cached and
+            # newly generated reasoning alike before it can reach a panel.
+            print(f"propose: rejected unsupported probability wording for {condition!r}")
             continue
 
         def keep(key, allowed):
