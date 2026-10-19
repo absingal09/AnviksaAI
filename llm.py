@@ -25,11 +25,10 @@ DETERMINISM. temperature=0 and a fixed seed, always. Confirmed live on this
 model: with no sampling params set, three back-to-back calls on identical
 input returned different results, which changed what was on screen for
 reasons that had nothing to do with the patient. The seed moves only on
-retry — see _with_retry.
+retry — see call_tool().
 
-PROVIDER HISTORY lives in git log and in extract.py.groq-batched-wip. The
-short version: Gemini fabricated present findings for topics never
-discussed; Groq's org cap forced the 223-code catalog into four batches;
+PROVIDER HISTORY (see git log): Gemini fabricated present findings for
+topics never discussed; Groq's org cap forced the catalog into four batches;
 Sarvam fits the whole thing in one request and is already the provider
 capture.py uses for STT, vision and TTS, so it needs no second credential.
 """
@@ -120,6 +119,11 @@ def call_tool(system_prompt, user_content, tool, *, max_tokens=4096, max_retries
                 ],
                 tools=[tool],
                 tool_choice={"type": "function", "function": {"name": tool["function"]["name"]}},
+                # Sarvam defaults to thinking mode, whose tokens share this
+                # output budget. It can exhaust the budget (especially the
+                # short document screen) before emitting any tool arguments.
+                # Send explicit null: omitting the field enables thinking.
+                reasoning_effort=None,
                 temperature=0.0,
                 # The seed moves ONLY on retry. Observed live: with
                 # temperature=0 and a fixed seed, a ToolCallMissing response

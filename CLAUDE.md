@@ -218,8 +218,10 @@ propose.py         findings -> candidates + supporting/opposing findings + reaso
 engine.py          severity band, exclusion state, support ordering, next question
 severity.yaml      harm-if-missed + exclusion rules   <- clinical judgment, hand-written
 findings.yaml      the finding vocabulary             <- hand-written
-canonical_case.yaml the one case that defines correct output
-selftest.py        invariants: never re-ask, exclusion, severity floor, determinism
+cases/            regression cases; _template.yaml describes the schema and is skipped
+selftest.py        offline invariants and expressibility checks for every case
+run_cases.py       manual live extract/propose/triage checks; needs SARVAM_API_KEY
+.github/workflows/selftest.yml  Python 3.12 offline suite on pushes and pull requests
 main.py            FastAPI: /capture (STT/OCR + screen), /analyze (extract+propose+triage), /speak
 web/index.html     single file, no build step
 render.yaml        the free deployment; the key is entered in the
@@ -239,9 +241,25 @@ latency on every single action. Merging them back reintroduces that.
 
 ## The canonical case
 
-`canonical_case.yaml`. It replaced `demo_case.py` and `contract.json`, which
-were written in DDXPlus codes. It is read by tests and by humans and never
-reaches the screen — it is not a demo script, and nothing renders from it.
+`cases/` replaces the old DDXPlus-coded demo fixtures. The original case lives
+unchanged at `cases/pe_masquerading_as_panic.yaml`; `cases/_template.yaml`
+describes the schema without adding another clinical case. Both runners skip
+underscore-prefixed files. Nothing renders from these fixtures or preloads them
+into the UI.
+
+`python selftest.py` stays offline and checks each case's vocabulary references
+alongside the existing rulebook invariants. With the single PE case it still
+runs all 94 checks. GitHub Actions runs this suite on every push and pull request
+with Python 3.12 and no API key.
+
+`python run_cases.py` is a separate, manual live runner requiring
+`SARVAM_API_KEY`. `python run_cases.py pe_masquerading_as_panic` selects one case
+by ID. It feeds transcript and document text through extraction, proposal, and
+engine triage, then prints PASS/FAIL for findings, candidates, the next question,
+and numeric-output restrictions (plus reasoning and exclusion expectations).
+It reuses the existing caches, so unchanged cases with the same model/prompts
+make no new calls while their responses are cached. Neither the offline suite
+nor CI invokes it. These regressions are not measured clinical accuracy.
 
 The case that has always exercised this product properly: 34F, sudden chest
 tightness and dyspnoea, a photographed strip revealing a combined oral
@@ -277,7 +295,9 @@ gitignored 172 MB dataset.
 2. ~~Rewrite `severity.yaml`~~ — 91 conditions, 75 panel-eligible, every one
    with an exclusion rule (0 missing, 0 orphans).
 3. ~~Author `findings.yaml`~~ — 217 findings, all binary, plus labels for all
-   83 exclusion actions. `canonical_case.yaml` authored alongside it.
+   83 exclusion actions. The original case, now in
+   `cases/pe_masquerading_as_panic.yaml`, was authored alongside it; offline
+   invariants and the manual `run_cases.py` now read the `cases/` folder.
 4. ~~Write `propose.py`, rewrite `extract.py`~~ — two calls, `llm.py` shared
    between them, both cached at `temperature=0`.
 5. ~~Strip `engine.py`~~ — no probability is computed anywhere; numpy gone.

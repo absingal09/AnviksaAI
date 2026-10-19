@@ -261,9 +261,17 @@ def screen_document(text):
         print(f"screen_document: failed, treating as clinical — {e}")
         return {"clinical": True, "kind": "not screened"}
 
+    if not isinstance(parsed, dict):
+        return {"clinical": True, "kind": "not screened"}
+    clinical = parsed.get("clinical")
+    if isinstance(clinical, str) and clinical.strip().lower() in ("true", "false"):
+        clinical = clinical.strip().lower() == "true"
+    if not isinstance(clinical, bool):
+        return {"clinical": True, "kind": "not screened"}
+    kind = parsed.get("kind")
     return {
-        "clinical": bool(parsed.get("clinical", True)),
-        "kind": (parsed.get("kind") or "unrecognised").strip(),
+        "clinical": clinical,
+        "kind": kind.strip() if isinstance(kind, str) and kind.strip() else "unrecognised",
     }
 
 
@@ -323,10 +331,18 @@ def extract(transcript, doc_text=""):
 
     parsed = llm.cached(cpath, produce)
 
+    if not isinstance(parsed, dict):
+        return {}, {}
     findings, quotes, dropped = {}, {}, []
+    recorded_states = {}
     for state, key in ((True, "present"), (False, "absent")):
-        for item in parsed.get(key) or []:
-            fid = (item.get("id") or "").strip()
+        items = parsed.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                continue
+            fid = item["id"].strip()
             if fid not in vocabulary.FINDINGS:
                 # Not in the vocabulary, so nothing downstream could match it
                 # across turns even if it were real. Dropped, and reported —
@@ -334,8 +350,19 @@ def extract(transcript, doc_text=""):
                 # something the model keeps reaching for.
                 dropped.append(fid)
                 continue
+            recorded_states.setdefault(fid, set()).add(state)
+            evidence = item.get("evidence")
+            if not isinstance(evidence, str) or not evidence.strip():
+                continue
             findings[fid] = state
-            quotes[fid] = (item.get("evidence") or "").strip()
+            quotes[fid] = evidence.strip()
+
+    # A contradictory model response does not settle the finding. In
+    # particular, iteration order must never turn a present finding absent.
+    for fid, states in recorded_states.items():
+        if len(states) > 1:
+            findings.pop(fid, None)
+            quotes.pop(fid, None)
 
     if dropped:
         print(f"extract: dropped {len(dropped)} id(s) not in findings.yaml: {sorted(set(dropped))}")

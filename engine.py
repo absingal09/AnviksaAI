@@ -160,8 +160,8 @@ class Engine:
         self.severity = severity
         self.excluded_by = excluded_by
         # Another name for the SAME rulebook entry, so "Systemic lupus
-        # erythematosus flare" finds the entry written as "SLE". Matched by
-        # the same two rules as the canonical name.
+        # erythematosus flare" finds the entry written as "SLE". Aliases use
+        # containment matching only, never the loose distinctive-word rule.
         self.aliases = dict(aliases or {})
         # token -> the single rated condition whose name contains it, for
         # tokens appearing in exactly one. See match(), rule 2.
@@ -439,7 +439,25 @@ class Engine:
         asked:                 findings already put to the patient but not yet
                                answered, so they are not asked again.
         """
-        confirmed = set(confirmed_exclusions)
+        def exclusion_key(condition):
+            found = self.match(condition)
+            return ("rated", found[0]) if found else ("unrated", condition.strip().casefold())
+
+        confirmed = {exclusion_key(condition) for condition in confirmed_exclusions}
+        candidates = list(candidates)
+        proposed = {exclusion_key(c["condition"]) for c in candidates}
+        for condition in sorted(set(confirmed_exclusions)):
+            key = exclusion_key(condition)
+            if key not in proposed:
+                # Confirmation is consultation state even when the model stops
+                # proposing this condition. Do not fabricate clinical reasoning
+                # or retain patient state on the shared Engine instance.
+                candidates.append({
+                    "condition": condition,
+                    "reasoning": "Confirmed ruled out by the clinician during this consultation.",
+                    "supported_by": [], "opposed_by": [], "unresolved": [],
+                })
+                proposed.add(key)
 
         # Abstain visibly. No candidates means say so — never fall back to
         # something generic styled as though it came from this patient.
@@ -497,7 +515,7 @@ class Engine:
                 ],
             }
 
-            if condition in confirmed:
+            if exclusion_key(condition) in confirmed:
                 # Kept and shown, not deleted. The clinician needs to see that
                 # it was considered and cleared — that is what lets the panel
                 # be finished rather than merely emptied.
@@ -544,7 +562,7 @@ class Engine:
             and vocabulary.FINDINGS.get(f, {}).get("system") != "onset"
         ]
 
-        live = [c for c in candidates if c["condition"] not in confirmed]
+        live = [c for c in candidates if exclusion_key(c["condition"]) not in confirmed]
 
         return {
             "abstaining": False,

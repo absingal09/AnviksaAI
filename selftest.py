@@ -20,15 +20,23 @@ happens no amount of green output here means the panel is useful. Do not read
 a pass as a safety claim.
 """
 
+import io
 import json
 import re
+import runpy
+import subprocess
 import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
+import httpx
 import yaml
 
 import engine
 import extract
+import llm
 import propose
 import vocabulary
 
@@ -52,6 +60,51 @@ def check(name, condition, detail=""):
 
 def section(title):
     print(f"\n{title}")
+
+
+def browser_checks(scenario):
+    """Execute the real frontend in Node with a fake DOM and no network."""
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    source = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    harness = r"""
+const fs = require('fs');
+const vm = require('vm');
+const source = fs.readFileSync(0, 'utf8');
+const elements = new Map();
+function element() {
+  const classes = new Set();
+  return {
+    innerHTML:'', textContent:'', value:'', disabled:false, style:{}, dataset:{},
+    parentElement:{scrollTop:0}, appendChild(){}, addEventListener(){},
+    querySelector(){return null;}, querySelectorAll(){return [];},
+    classList:{add(c){classes.add(c);}, remove(c){classes.delete(c);},
+      contains(c){return classes.has(c);},
+      toggle(c,on){if(on===undefined)on=!classes.has(c);if(on)classes.add(c);else classes.delete(c);}}
+  };
+}
+const document = {
+  getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id);},
+  createElement:element, addEventListener(){}
+};
+const context = vm.createContext({document,console,AbortController,
+  setTimeout(){return 1;},clearTimeout(){},
+  fetch(){throw new Error('Unexpected fetch in an offline browser test');}});
+vm.runInContext(source, context);
+const run = code => vm.runInContext(code, context);
+(async()=>{
+  const results = {};
+  // SCENARIO
+  process.stdout.write(JSON.stringify(results));
+})().catch(error=>{console.error(error.stack);process.exitCode=1;});
+""".replace("// SCENARIO", scenario)
+    try:
+        result = subprocess.run(["node", "-e", harness], input=source, text=True, encoding="utf-8",
+                                capture_output=True, cwd=ROOT, timeout=10)
+    except FileNotFoundError:
+        sys.exit("Node.js is required for the browser checks")
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip())
+    return json.loads(result.stdout)
 
 
 # A candidate set standing in for propose.py's output. Hand-written so these
@@ -384,6 +437,29 @@ check("an excluded condition no longer drives the next question",
       after["next_question"] is None
       or "Pulmonary embolism" not in after["next_question"]["divides"])
 
+renamed_pe = dict(CANDIDATES[0], condition="Acute pulmonary embolism")
+renamed_exclusion = eng.assess([renamed_pe], FINDINGS,
+                              confirmed_exclusions=["Pulmonary embolism"])
+check("a confirmed exclusion covers severity-matched naming variants",
+      not renamed_exclusion["cant_miss"] and len(renamed_exclusion["ruled_out"]) == 1)
+check("an excluded naming variant does not drive the next question",
+      renamed_exclusion["next_question"] is None)
+reverse_exclusion = eng.assess([CANDIDATES[0]], FINDINGS,
+                              confirmed_exclusions=["Acute pulmonary embolism"])
+check("confirmation under a variant also excludes the canonical name",
+      not reverse_exclusion["cant_miss"] and len(reverse_exclusion["ruled_out"]) == 1)
+missing_proposal = eng.assess([CANDIDATES[1]], FINDINGS,
+                             confirmed_exclusions=["Pulmonary embolism"])
+check("a confirmed exclusion stays auditable when no longer proposed",
+      any(r["condition"] == "Pulmonary embolism" and r["reasoning"]
+          for r in missing_proposal["ruled_out"]))
+audit_only = eng.assess([], FINDINGS, confirmed_exclusions=["Pulmonary embolism"])
+check("an audit-only consultation still shows its confirmed exclusions",
+      not audit_only["abstaining"] and len(audit_only["ruled_out"]) == 1
+      and not audit_only["cant_miss"] and audit_only["next_question"] is None)
+check("a naming variant without clinician confirmation stays open",
+      len(eng.assess([renamed_pe], FINDINGS)["cant_miss"]) == 1)
+
 
 # ===========================================================================
 section("abstain visibly; fabricate nothing")
@@ -427,6 +503,370 @@ check("a malformed candidate renders instead of crashing the panel", ok, str(bog
 
 
 # ===========================================================================
+section("structured chat returns data instead of spending the output budget thinking")
+
+
+def offline_chat(reply):
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        message, finish_reason = reply(body, len(requests))
+        return httpx.Response(200, json={
+            "id": "offline-chat", "created": 0, "model": llm.MODEL,
+            "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
+        sdk = llm.SarvamAI(api_subscription_key="offline-test-key", httpx_client=transport)
+        with patch.object(llm, "client", return_value=sdk), patch.object(llm.time, "sleep"):
+            try:
+                result = llm.call_tool("offline system", "offline input", extract._SCREEN_TOOL, max_tokens=256)
+                error = None
+            except Exception as exc:
+                result, error = None, exc
+    return result, requests, error
+
+
+screen_arguments = {"clinical": True, "kind": "offline document"}
+screen_reply = {"role": "assistant", "tool_calls": [{
+    "id": "offline-tool", "type": "function", "function": {
+        "name": "screen_document", "arguments": json.dumps(screen_arguments),
+    },
+}]}
+missing_reply = {"role": "assistant", "content": None, "reasoning_content": "offline thinking"}
+
+result, chat_requests, error = offline_chat(lambda body, attempt:
+    (screen_reply, "tool_calls") if "reasoning_effort" in body and body["reasoning_effort"] is None
+    else (missing_reply, "length"))
+check("the SDK explicitly sends null reasoning_effort to disable hidden thinking",
+      bool(chat_requests) and all("reasoning_effort" in r and r["reasoning_effort"] is None for r in chat_requests))
+check("a short structured screening response succeeds without consuming retries",
+      not error and result == screen_arguments and len(chat_requests) == 1, str(error))
+
+result, chat_requests, error = offline_chat(lambda body, attempt:
+    (missing_reply, "length") if attempt == 1 else (screen_reply, "tool_calls"))
+check("missing tool calls still retry with a changed seed and the original forced schema",
+      not error and result == screen_arguments and [r["seed"] for r in chat_requests] == [0, 1]
+      and all(r["temperature"] == 0 and r["max_tokens"] == 256
+              and r["tools"] == [extract._SCREEN_TOOL]
+              and r["tool_choice"] == {"type": "function", "function": {"name": "screen_document"}}
+              for r in chat_requests), str(error))
+result, chat_requests, error = offline_chat(lambda body, attempt: (missing_reply, "length"))
+check("exhausted tool-call retries remain an error rather than an empty clinical result",
+      isinstance(error, llm.ToolCallMissing) and result is None and len(chat_requests) == 2)
+
+
+# ===========================================================================
+section("model output validation")
+# All nonempty extraction/screening responses are mocked: never call a model.
+def extracted_response(response):
+    with patch.object(extract.llm, "cached", return_value=response):
+        try:
+            return extract.extract("offline test input"), None
+        except Exception as exc:
+            return ({}, {}), str(exc)
+
+validated, error = extracted_response({
+    "present": [{"id": "fever", "evidence": "  "}],
+    "absent": [{"id": "cough", "evidence": ""}],
+})
+check("findings with empty evidence quotes are dropped", not error and validated == ({}, {}), str(validated))
+validated, error = extracted_response({
+    "present": [{"id": "fever", "evidence": "fever"}, {"id": "cough", "evidence": "cough"}],
+    "absent": [{"id": "fever", "evidence": "no fever"}],
+})
+check("conflicting present and absent IDs become unknown with no quote",
+      not error and validated == ({"cough": True}, {"cough": "cough"}), str(validated))
+validated, error = extracted_response({
+    "present": [{"id": "fever", "evidence": "fever"}],
+    "absent": [{"id": "fever", "evidence": ""}],
+})
+check("a conflicting ID is unknown even when one quote is empty",
+      not error and validated == ({}, {}), str(validated))
+validated, error = extracted_response({
+    "present": [None, "fever", 7, [], {}, {"id": 7, "evidence": "x"},
+                {"id": "fever", "evidence": ["x"]}, {"id": "cough", "evidence": "cough"}],
+    "absent": {"id": "fever", "evidence": "no fever"},
+})
+check("malformed extraction entries are skipped while valid entries survive",
+      not error and validated == ({"cough": True}, {"cough": "cough"}), error or str(validated))
+validated, error = extracted_response(["not an extraction object"])
+check("a malformed extraction response does not crash",
+      not error and validated == ({}, {}), error or str(validated))
+for raw, expected_clinical in [("false", False), (" FALSE ", False), ("true", True), (False, False), (True, True)]:
+    with patch.object(extract.llm, "cached", return_value={"clinical": raw, "kind": "test document"}):
+        screened = extract.screen_document("offline OCR test")
+    check(f"document screening parses {raw!r} as {expected_clinical}", screened["clinical"] is expected_clinical)
+with patch.object(extract.llm, "cached", return_value=["malformed screen response"]):
+    try:
+        screened, error = extract.screen_document("offline OCR test"), None
+    except Exception as exc:
+        screened, error = {}, str(exc)
+check("malformed screening output keeps the document visibly unscreened",
+      not error and screened == {"clinical": True, "kind": "not screened"}, error or str(screened))
+
+
+# ===========================================================================
+section("candidate reasoning does not invent certainty")
+withheld_reasoning = "Reasoning withheld: the model used numeric or probability wording."
+
+
+def reasoning_payload_is_clean(candidates):
+    payload = json.dumps(eng.assess(candidates, FINDINGS), ensure_ascii=False)
+    # The fixed withholding notice explains the removal; it is not a model claim.
+    model_text = payload.replace(withheld_reasoning, "")
+    return not re.search(
+        r"[%％]|\b(?:percent(?:age)?|per\s+cent|probabilit(?:y|ies)|likelihood|confidence)\b"
+        r"|\bchance\s+of\b|\bp\s*(?:=|\()|\b\d+\.\d+\b", model_text, re.I)
+
+
+for unsafe_reasoning in ["A 95% chance of PE", "The probability of PE is high.",
+                         "There is a chance of PE.", "Ninety-five percent certainty.",
+                         "P(PE) = 0.95.", "The likelihood of PE is high."]:
+    response = {"candidates": [dict(CANDIDATES[0], reasoning=unsafe_reasoning), CANDIDATES[1]]}
+    with patch.object(propose.llm, "cached", return_value=response):
+        checked_candidates = propose.propose(FINDINGS)
+    check(f"unsafe reasoning is withheld without losing its candidate: {unsafe_reasoning}",
+          checked_candidates == [dict(CANDIDATES[0], reasoning=withheld_reasoning), CANDIDATES[1]])
+    check(f"unsupported claim cannot reach the payload: {unsafe_reasoning}",
+          reasoning_payload_is_clean(checked_candidates))
+
+mixed_reasoning = "A 95% chance of PE. Sudden breathlessness after a long journey."
+with patch.object(propose.llm, "cached", return_value={
+        "candidates": [dict(CANDIDATES[0], reasoning=mixed_reasoning)]}):
+    checked_candidates = propose.propose(FINDINGS)
+check("only the unsupported sentence is removed, preserving candidate evidence",
+      checked_candidates == [dict(CANDIDATES[0], reasoning="Sudden breathlessness after a long journey.")])
+check("mixed reasoning cannot leak a percentage or probability claim into the payload",
+      reasoning_payload_is_clean(checked_candidates))
+
+with patch.object(propose.llm, "cached", return_value={"candidates": [CANDIDATES[0]]}):
+    checked_candidates = propose.propose(FINDINGS)
+check("factual candidate reasoning survives validation",
+      len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] == CANDIDATES[0]["reasoning"])
+
+
+# ===========================================================================
+section("browser checks require Node.js")
+with patch.object(subprocess, "run", side_effect=FileNotFoundError("node is not installed")):
+    try:
+        browser_checks("")
+        missing_node_exit = None
+    except (SystemExit, Exception) as exc:
+        missing_node_exit = exc
+check("missing Node.js exits with a clear prerequisite message",
+      isinstance(missing_node_exit, SystemExit)
+      and missing_node_exit.code == "Node.js is required for the browser checks",
+      str(missing_node_exit))
+
+
+# ===========================================================================
+section("patient details are rendered as text")
+try:
+    browser_result = browser_checks(r"""
+run(`SETUP={name:'<img src=x onerror="alert(1)"> & Alice',age:'34',gender:'F',
+  caseId:'<svg onload="alert(2)">',languageCode:'en-IN'};paintPatientBar();`);
+const header = elements.get('patientbar').innerHTML;
+results.escaped_name = header.includes('&lt;img') && header.includes('&amp; Alice') && !header.includes('<img');
+results.escaped_case_id = header.includes('&lt;svg') && header.includes('&quot;alert(2)&quot;') && !header.includes('<svg');
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+check("patient name cannot insert HTML into the header", browser_result.get("escaped_name", False), browser_error)
+check("case ID cannot insert HTML into the header", browser_result.get("escaped_case_id", False), browser_error)
+
+
+# ===========================================================================
+section("scanned documents can be set aside and restored")
+try:
+    browser_result = browser_checks(r"""
+let rows=[];
+const docs=document.getElementById('docs');
+Object.defineProperty(docs,'innerHTML',{set(){rows=[];},get(){return '';}});
+docs.appendChild=row=>rows.push(row);
+document.createElement=()=>{
+  const row=element(), thumb=element(), toggle=element();
+  row.querySelector=selector=>selector==='.thumb' ? thumb
+    : selector==='button[data-doc]' && /<button[^>]*data-doc=/.test(row.innerHTML) ? toggle : null;
+  return row;
+};
+let scheduled=0;
+context.setTimeout=()=>{scheduled++;return scheduled;};
+run(`liveTranscriptExtra='recorded consultation';scannedDocs=[
+  {name:'clinical.txt',text:'first document text',chars:19,clinical:true,kind:'clinical record',use:true},
+  {name:'other.txt',text:'other document text',chars:19,clinical:true,kind:'clinical record',use:true},
+  {name:'rejected.txt',text:'retained rejected text',chars:22,clinical:false,kind:'screenshot',use:false}
+];renderScannedDocs();`);
+const original=run('JSON.stringify(scannedDocs[0])');
+const aside=rows[0].querySelector('button[data-doc]');
+results.clinical_control=!!aside && rows[0].innerHTML.includes('Set aside');
+if(aside){
+  aside.onclick();
+  results.excludes_selected=run(`!scannedDocs[0].use && docText()==='other document text'
+    && liveTranscriptExtra==='recorded consultation'`) && elements.get('docn').textContent==='1 of 3 used';
+  results.schedules_analysis=scheduled===1;
+  rows[0].querySelector('.thumb').onclick();
+  results.retains_text=elements.get('doc-modal-body').textContent==='first document text';
+  const restore=rows[0].querySelector('button[data-doc]');
+  if(restore)restore.onclick();
+  results.restores_document=run('JSON.stringify(scannedDocs[0])')===original
+    && run(`docText()==='first document text\\n\\nother document text'`) && scheduled===2;
+}
+const rejected=rows[2].querySelector('button[data-doc]');
+if(rejected)rejected.onclick();
+results.restores_rejected=run(`scannedDocs[2].use && docText().includes('retained rejected text')`);
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+for key, description in [
+    ("clinical_control", "included clinical documents expose a Set aside control"),
+    ("excludes_selected", "setting aside removes only that document from analysis"),
+    ("schedules_analysis", "setting aside schedules analysis with the updated evidence"),
+    ("retains_text", "a set-aside document's extracted text remains readable"),
+    ("restores_document", "restoring a clinical document preserves its text and screening metadata"),
+    ("restores_rejected", "a screened-out document can still be included manually"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
+
+
+# ===========================================================================
+section("analysis results follow the current consultation and evidence")
+try:
+    browser_result = browser_checks(r"""
+function stage(marker){return {abstaining:false,message:null,
+  cant_miss:[{condition:marker,reasoning:'offline fixture',severity_band:'critical',support:'limited',
+    supported_by:[],opposed_by:[],exclusion_options:[]}],
+  differential:[],unrated:[],ruled_out:[],doesnt_fit:[],next_question:null};}
+function prime(){
+  run('reset()');context.priorStage=stage('old-result');
+  run(`dxState={stage:priorStage};cmState={stage:priorStage};committed=true;hasLiveInput=true;
+    liveTranscriptExtra='offline evidence';paintDX();paintCM();paintQB();paintMIS();`);
+}
+function response(data){return {ok:true,json:async()=>data};}
+prime();run(`liveTranscriptExtra='';scannedDocs=[{use:false,text:'removed document'}];`);
+await run('runAnalyze()');
+results.empty_clears = run('dxState===null && cmState===null') && !elements.get('cm').innerHTML.includes('old-result');
+prime();run(`liveTranscriptExtra='  ';scannedDocs=[];`);await run('runAnalyze()');
+results.whitespace_clears = run('dxState===null && cmState===null');
+
+prime();let finishOld;
+context.fetch=()=>new Promise(resolve=>{finishOld=resolve;});
+const oldRequest=run('runAnalyze()');run('reset()');
+results.reset_unlocks = run('analyzeInFlight===false');
+finishOld(response(stage('old-response')));await oldRequest;
+results.reset_ignores_response = run('dxState===null && cmState===null');
+
+prime();const finishes=[];
+context.fetch=()=>new Promise(resolve=>finishes.push(resolve));
+const older=run('runAnalyze()');run(`reset();committed=true;hasLiveInput=true;liveTranscriptExtra='new evidence';`);
+const newer=run('runAnalyze()');
+finishes[0](response(stage('old-response')));await older;
+results.old_request_does_not_unlock_new = finishes.length===2 && run('analyzeInFlight===true && dxState===null');
+if(finishes[1])finishes[1](response(stage('new-response')));await newer;
+results.new_response_wins = run(`dxState && dxState.stage.cant_miss[0].condition==='new-response'`);
+
+prime();let finishRemoved;
+context.fetch=()=>new Promise(resolve=>{finishRemoved=resolve;});
+const removedRequest=run('runAnalyze()');run(`liveTranscriptExtra='';scannedDocs=[];`);await run('runAnalyze()');
+finishRemoved(response(stage('removed-evidence-result')));await removedRequest;
+results.removed_response_ignored = run('dxState===null && cmState===null');
+
+prime();context.fetch=async()=>({ok:false,status:502,json:async()=>({detail:'provider unavailable'})});
+await run('runAnalyze()');
+results.http_failure_visible = document.getElementById('analysis-error').textContent.includes('provider unavailable')
+  && document.getElementById('analysis-error').textContent.toLowerCase().includes('stale')
+  && elements.get('cmtag').textContent.toLowerCase().includes('stale')
+  && elements.get('cm').innerHTML.includes('old-result');
+context.fetch=async()=>response(stage('recovered-result'));await run('runAnalyze()');
+results.recovery_clears_error = document.getElementById('analysis-error').textContent===''
+  && !elements.get('cmtag').textContent.toLowerCase().includes('stale')
+  && elements.get('cm').innerHTML.includes('recovered-result');
+prime();context.fetch=async()=>{throw new Error('connection lost');};await run('runAnalyze()');
+results.network_failure_visible = document.getElementById('analysis-error').textContent.includes('connection lost')
+  && document.getElementById('analysis-error').textContent.toLowerCase().includes('stale');
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+for key, description in [
+    ("empty_clears", "removing all included evidence clears old results"),
+    ("whitespace_clears", "whitespace-only evidence also clears results"),
+    ("reset_unlocks", "reset allows a new analysis without waiting for the old request"),
+    ("reset_ignores_response", "analysis responses from before reset are ignored"),
+    ("old_request_does_not_unlock_new", "an obsolete request cannot unlock a newer request"),
+    ("new_response_wins", "the new consultation receives its own analysis"),
+    ("removed_response_ignored", "removed evidence cannot return via an in-flight response"),
+    ("http_failure_visible", "HTTP failures retain old results with a visible stale warning"),
+    ("recovery_clears_error", "successful analysis clears the previous error and stale marker"),
+    ("network_failure_visible", "network failures are visible instead of silently reverting"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
+
+
+# ===========================================================================
+section("proposal cache invalidation includes finding labels")
+def proposal_cache_key():
+    module = runpy.run_path(str(ROOT / "propose.py"), run_name="offline_cache_test")
+    keys = []
+
+    def cached_result(path, produce):
+        keys.append(str(path))
+        return {"candidates": []}
+
+    with patch.object(propose.llm, "cached", side_effect=cached_result):
+        module["propose"]({"headache": True})
+    return keys[0]
+
+original_key = proposal_cache_key()
+with patch.dict(vocabulary.FINDINGS["headache"], {"label": "Changed label for an offline cache test"}):
+    changed_key = proposal_cache_key()
+check("changing only a finding label invalidates proposal responses", original_key != changed_key)
+check("unchanged finding labels retain the same proposal cache key", original_key == proposal_cache_key())
+
+
+# ===========================================================================
+section("unrated logging contains no consultation evidence")
+import main
+
+with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-unrated-") as log_test_dir:
+    log_path = Path(log_test_dir) / "cache" / "unrated_log.jsonl"
+    request = main.AnalyzeRequest(transcript="PRIVATE_TRANSCRIPT", doc_text="PRIVATE_DOCUMENT")
+    with patch.object(main, "REPO_ROOT", Path(log_test_dir)), \
+            patch.object(main.extract, "extract", return_value=(FINDINGS, {"breathlessness": "PRIVATE_QUOTE"})), \
+            patch.object(main.propose, "propose", return_value=[CANDIDATES[-1]]):
+        logged_payload = main._pipeline(request)
+        records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()] if log_path.exists() else []
+        check("an unrated log line contains only timestamp and condition",
+              len(records) == 1 and set(records[0]) == {"timestamp", "condition"}
+              and records[0]["condition"] == CANDIDATES[-1]["condition"]
+              and "PRIVATE_" not in json.dumps(records), str(records))
+        valid_timestamp = False
+        if records:
+            try:
+                valid_timestamp = datetime.fromisoformat(records[0]["timestamp"]).tzinfo is not None
+            except (KeyError, TypeError, ValueError):
+                pass
+        check("the unrated log timestamp is timezone-aware ISO format", valid_timestamp)
+        main._pipeline(request)
+        records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()] if log_path.exists() else []
+        check("unrated conditions append one private-safe line per analysis",
+              len(records) == 2 and all(set(r) == {"timestamp", "condition"} for r in records))
+        log_error = io.StringIO()
+        with patch.object(Path, "open", side_effect=PermissionError("offline log write failure")), \
+                patch("sys.stderr", log_error):
+            try:
+                failed_log_payload, error = main._pipeline(request), None
+            except Exception as exc:
+                failed_log_payload, error = {}, str(exc)
+        check("a log write failure is reported without hiding the clinical panel",
+              not error and bool(failed_log_payload.get("unrated")) and "log" in log_error.getvalue().lower(), error or log_error.getvalue())
+
+
+# ===========================================================================
 section("determinism — identical input, identical output")
 # ===========================================================================
 # Confirmed live once: identical input returned different findings run to run
@@ -443,21 +883,30 @@ check("candidate order from propose.py does not change the panel", a == c)
 
 
 # ===========================================================================
-section("the canonical case is expressible")
+section("the case fixtures are expressible")
 # ===========================================================================
 # Without this, nothing defines what correct output looks like and there is
 # nothing for a regression to be measured against.
-case = yaml.safe_load((ROOT / "canonical_case.yaml").read_text(encoding="utf-8"))
-ef = case["expected_findings"]
-refs = ef["present"] + ef["absent"] + ef["must_be_unknown"] + case["expectations"]["next_question_in"]
-unknown_refs = sorted(f for f in refs if f not in vocabulary.FINDINGS)
-check("every finding the canonical case names exists in the vocabulary",
-      not unknown_refs, str(unknown_refs))
-check("pulmonary embolism is rated at the top severity band",
-      eng.band("Pulmonary embolism")[0] == "critical")
-check("pulmonary embolism can be excluded", len(eng.exclusion_options("Pulmonary embolism")) > 0)
-check("the doctor's own working diagnosis is rated, not unrated",
-      eng.band("Panic attack")[0] != "unrated")
+case_paths = sorted(p for p in (ROOT / "cases").glob("*.yaml") if not p.name.startswith("_"))
+if not case_paths:
+    raise RuntimeError("No case fixtures found in cases/ (underscore-prefixed files are skipped)")
+for case_path in case_paths:
+    case = yaml.safe_load(case_path.read_text(encoding="utf-8"))
+    print(f"  case: {case['case']['id']}")
+    ef = case["expected_findings"]
+    refs = ef["present"] + ef["absent"] + ef["must_be_unknown"] + case["expectations"]["next_question_in"]
+    unknown_refs = sorted(f for f in refs if f not in vocabulary.FINDINGS)
+    check("every finding the case names exists in the vocabulary",
+          not unknown_refs, str(unknown_refs))
+    check("pulmonary embolism is rated at the top severity band",
+          eng.band("Pulmonary embolism")[0] == "critical")
+    check("pulmonary embolism can be excluded", len(eng.exclusion_options("Pulmonary embolism")) > 0)
+    check("the doctor's own working diagnosis is rated, not unrated",
+          eng.band("Panic attack")[0] != "unrated")
+
+pe_fixture = ROOT / "cases" / "pe_masquerading_as_panic.yaml"
+check("the PE fixture's first comment uses its current filename",
+      pe_fixture.read_text(encoding="utf-8").splitlines()[0].startswith("# pe_masquerading_as_panic.yaml"))
 
 
 # ===========================================================================

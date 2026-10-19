@@ -1,12 +1,11 @@
-# canonical_case.yaml — the one case that defines what correct output means.
+# pe_masquerading_as_panic.yaml — the one case that defines what correct output means.
 #
 # There is no dataset, no eval, and no measured accuracy anywhere in this
 # project. This file is the closest thing to a regression test that exists:
 # a single consultation, written out in full, with what the panel MUST do
 # with it stated explicitly.
 #
-# It replaces demo_case.py and contract.json, which were written in DDXPlus
-# evidence codes and went away with the dataset.
+# It replaces the old DDXPlus-coded demo fixtures, removed with the dataset.
 #
 # THIS IS NOT A DEMO SCRIPT. Nothing renders from it, no walkthrough plays it
 # back, and no pre-fed state is loaded into the UI from it. The last build had
@@ -44,9 +43,9 @@ case:
 # exists to test that, not for playback.
 input:
 
-  # The recording, as saaras-v3 would return it after diarisation. Written in
-  # English; a real Indian OPD consult is code-mixed and capture.transcribe()
-  # returns both the original and an English gloss. Extraction reads the gloss.
+  # The recording, as saaras-v3 would transcribe it. Written in English;
+  # a real Indian OPD consult is code-mixed. main.py optionally adds an
+  # English gloss for display; extraction receives the original transcript.
   transcript: |
     Doctor: Come, sit. What's the problem?
     Patient: Doctor, since this morning my chest feels tight. Like something

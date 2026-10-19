@@ -43,9 +43,16 @@ reasoning below is the safety net, which is why every candidate must carry it.
 """
 
 import json
+import re
 
 import llm
 import vocabulary
+
+_UNSUPPORTED_REASONING = re.compile(
+    r"[%％]|\b(?:percent(?:age)?|per\s+cent|probabilit(?:y|ies)|likelihood|confidence)\b"
+    r"|\bchance\s+of\b|\bp\s*(?:=|\()",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = """You are helping a clinician in a two-minute outpatient \
 consultation remember what is worth not forgetting.
@@ -196,7 +203,8 @@ _TOOL = {
 # results instead of being silently ignored.
 _PROMPT_VERSION = llm.content_hash(
     SYSTEM_PROMPT, json.dumps(_TOOL, sort_keys=True),
-    json.dumps(sorted(vocabulary.FINDINGS), ensure_ascii=False),
+    json.dumps({fid: meta["label"] for fid, meta in vocabulary.FINDINGS.items()},
+               sort_keys=True, ensure_ascii=False),
 )
 
 
@@ -266,11 +274,17 @@ def propose(findings):
     for raw in parsed.get("candidates") or []:
         condition = (raw.get("condition") or "").strip()
         reasoning = (raw.get("reasoning") or "").strip()
-        # Every candidate carries its reasoning. One that cannot justify
-        # itself cannot be checked by the clinician, and the clinician is the
-        # entire safety net — so it does not reach the panel at all.
+        # Require a named candidate and model reasoning before validation.
         if not condition or not reasoning:
             continue
+        if _UNSUPPORTED_REASONING.search(reasoning):
+            # Filter cached and new responses alike, retaining the candidate
+            # and its factual sentences. A decimal is not a sentence boundary.
+            sentences = re.split(r"(?<=[.!?])\s+", reasoning)
+            reasoning = " ".join(sentence for sentence in sentences
+                                 if not _UNSUPPORTED_REASONING.search(sentence))
+            if not reasoning:
+                reasoning = "Reasoning withheld: the model used numeric or probability wording."
 
         def keep(key, allowed):
             """Resolve to real ids in the right state, then filter.

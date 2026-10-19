@@ -1,0 +1,31 @@
+# Copy to <case_id>.yaml and replace placeholders with reviewed case material.
+# Files starting with an underscore are skipped by both test runners.
+version: 1
+
+case:
+  id: replace_with_case_id                # Stable ID, also accepted by run_cases.py.
+  summary: "Replace with a short case summary."
+
+input:
+  transcript: |
+    Replace with the consultation transcript.
+  document_text: |
+    Replace with document text, or use an empty string if there is none.
+  clinician_note: ""                     # Optional context; not sent to analysis.
+
+expected_findings:
+  # Use IDs from findings.yaml. Use [] for an empty expectation list.
+  present: [replace_with_present_finding_id]
+  absent: [replace_with_absent_finding_id]
+  must_be_unknown: [replace_with_unknown_finding_id]
+
+expectations:
+  must_appear_on_cant_miss: ["Replace with a condition name"]
+  must_appear_somewhere: ["Replace with a condition name"]
+  next_question_in: [replace_with_finding_id]
+  every_candidate_has_reasoning: true
+  no_number_in_output: true
+  cant_miss_entries_are_excludable: true
+
+expected_shape: >-
+  Describe the expected panel in words for human review.

@@ -18,8 +18,8 @@ Built and verified against the ACTUAL installed sarvamai==0.1.30 client,
 not its docs — those turned out to be wrong about several method names
 (target_language_code vs language_code, wait_until_complete() not
 existing on doc_ai jobs, get_file_results() not containing the transcript
-for batch STT jobs either). See test_sarvam.py's commit history and the
-throwaway scripts that found the batch STT flow for how each was found.
+for batch STT jobs either). The original SDK smoke tests and exploratory
+scripts in Git history document how the batch STT flow was verified.
 If you extend this file, verify new calls the same way: introspect the
 real client/response objects (or write a throwaway script and read the
 actual output) before trusting a docs page.
@@ -88,9 +88,9 @@ def transcribe(path, language_code="hi-IN", num_speakers=2):
          "language_code": ..., ...}
     so extract.py can use entries[i]["speaker_id"] to tell patient from
     doctor turns apart, rather than guessing from grammatical person alone.
-    This is a BREAKING return-type change from the single-string version
-    test_sarvam.py's smoke test used — that script calls the simpler
-    speech_to_text.transcribe directly and is unaffected by this change.
+    This replaces the single-string return type used by the earlier smoke
+    tests, retained in Git history. Those tests called the simpler
+    speech_to_text.transcribe directly.
 
     The real, verified call sequence (none of it guessable from docs —
     get_file_results()/get_status() are pass/fail bookkeeping only; the
