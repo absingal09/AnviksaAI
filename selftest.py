@@ -549,14 +549,38 @@ check("malformed screening output keeps the document visibly unscreened",
 
 # ===========================================================================
 section("candidate reasoning does not invent certainty")
+withheld_reasoning = "Reasoning withheld: the model used numeric or probability wording."
+
+
+def reasoning_payload_is_clean(candidates):
+    payload = json.dumps(eng.assess(candidates, FINDINGS), ensure_ascii=False)
+    # The fixed withholding notice explains the removal; it is not a model claim.
+    model_text = payload.replace(withheld_reasoning, "")
+    return not re.search(
+        r"[%％]|\b(?:percent(?:age)?|per\s+cent|probabilit(?:y|ies)|likelihood|confidence)\b"
+        r"|\bchance\s+of\b|\bp\s*(?:=|\()|\b\d+\.\d+\b", model_text, re.I)
+
+
 for unsafe_reasoning in ["A 95% chance of PE", "The probability of PE is high.",
                          "There is a chance of PE.", "Ninety-five percent certainty.",
                          "P(PE) = 0.95.", "The likelihood of PE is high."]:
     response = {"candidates": [dict(CANDIDATES[0], reasoning=unsafe_reasoning), CANDIDATES[1]]}
     with patch.object(propose.llm, "cached", return_value=response):
         checked_candidates = propose.propose(FINDINGS)
-    check(f"unsafe reasoning is rejected: {unsafe_reasoning}",
-          [c["condition"] for c in checked_candidates] == ["Panic attack"])
+    check(f"unsafe reasoning is withheld without losing its candidate: {unsafe_reasoning}",
+          checked_candidates == [dict(CANDIDATES[0], reasoning=withheld_reasoning), CANDIDATES[1]])
+    check(f"unsupported claim cannot reach the payload: {unsafe_reasoning}",
+          reasoning_payload_is_clean(checked_candidates))
+
+mixed_reasoning = "A 95% chance of PE. Sudden breathlessness after a long journey."
+with patch.object(propose.llm, "cached", return_value={
+        "candidates": [dict(CANDIDATES[0], reasoning=mixed_reasoning)]}):
+    checked_candidates = propose.propose(FINDINGS)
+check("only the unsupported sentence is removed, preserving candidate evidence",
+      checked_candidates == [dict(CANDIDATES[0], reasoning="Sudden breathlessness after a long journey.")])
+check("mixed reasoning cannot leak a percentage or probability claim into the payload",
+      reasoning_payload_is_clean(checked_candidates))
+
 with patch.object(propose.llm, "cached", return_value={"candidates": [CANDIDATES[0]]}):
     checked_candidates = propose.propose(FINDINGS)
 check("factual candidate reasoning survives validation",
