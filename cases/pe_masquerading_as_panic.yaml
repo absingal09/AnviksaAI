@@ -1,4 +1,4 @@
-# canonical_case.yaml — the one case that defines what correct output means.
+# pe_masquerading_as_panic.yaml — the one case that defines what correct output means.
 #
 # There is no dataset, no eval, and no measured accuracy anywhere in this
 # project. This file is the closest thing to a regression test that exists:

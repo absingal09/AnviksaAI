@@ -751,6 +751,10 @@ for case_path in case_paths:
     check("the doctor's own working diagnosis is rated, not unrated",
           eng.band("Panic attack")[0] != "unrated")
 
+pe_fixture = ROOT / "cases" / "pe_masquerading_as_panic.yaml"
+check("the PE fixture's first comment uses its current filename",
+      pe_fixture.read_text(encoding="utf-8").splitlines()[0].startswith("# pe_masquerading_as_panic.yaml"))
+
 
 # ===========================================================================
 print(f"\n{'=' * 70}")
