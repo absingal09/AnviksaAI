@@ -22,6 +22,7 @@ a pass as a safety claim.
 
 import json
 import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -648,6 +649,27 @@ for key, description in [
     ("network_failure_visible", "network failures are visible instead of silently reverting"),
 ]:
     check(description, browser_result.get(key, False), browser_error)
+
+
+# ===========================================================================
+section("proposal cache invalidation includes finding labels")
+def proposal_cache_key():
+    module = runpy.run_path(str(ROOT / "propose.py"), run_name="offline_cache_test")
+    keys = []
+
+    def cached_result(path, produce):
+        keys.append(str(path))
+        return {"candidates": []}
+
+    with patch.object(propose.llm, "cached", side_effect=cached_result):
+        module["propose"]({"headache": True})
+    return keys[0]
+
+original_key = proposal_cache_key()
+with patch.dict(vocabulary.FINDINGS["headache"], {"label": "Changed label for an offline cache test"}):
+    changed_key = proposal_cache_key()
+check("changing only a finding label invalidates proposal responses", original_key != changed_key)
+check("unchanged finding labels retain the same proposal cache key", original_key == proposal_cache_key())
 
 
 # ===========================================================================

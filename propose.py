@@ -203,7 +203,8 @@ _TOOL = {
 # results instead of being silently ignored.
 _PROMPT_VERSION = llm.content_hash(
     SYSTEM_PROMPT, json.dumps(_TOOL, sort_keys=True),
-    json.dumps(sorted(vocabulary.FINDINGS), ensure_ascii=False),
+    json.dumps({fid: meta["label"] for fid, meta in vocabulary.FINDINGS.items()},
+               sort_keys=True, ensure_ascii=False),
 )
 
 
