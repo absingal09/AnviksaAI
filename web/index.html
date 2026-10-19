@@ -817,7 +817,7 @@ $('new-consult').onclick=()=>{
 
 function paintPatientBar(){
   const lang=LANGUAGES.find(l=>l.code===SETUP.languageCode)||LANGUAGES[0];
-  $('patientbar').innerHTML=`<b>${SETUP.name}</b> · ${SETUP.gender}, <b>${SETUP.age}</b> · Case ID <b>${SETUP.caseId}</b> · <b>${lang.native}</b>`;
+  $('patientbar').innerHTML=`<b>${esc(SETUP.name)}</b> · ${SETUP.gender}, <b>${SETUP.age}</b> · Case ID <b>${esc(SETUP.caseId)}</b> · <b>${lang.native}</b>`;
 }
 
 // Pre-consultation setup: patient name/age/gender/Case ID and the consult

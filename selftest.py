@@ -22,6 +22,7 @@ a pass as a safety claim.
 
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -53,6 +54,48 @@ def check(name, condition, detail=""):
 
 def section(title):
     print(f"\n{title}")
+
+
+def browser_checks(scenario):
+    """Execute the real frontend in Node with a fake DOM and no network."""
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    source = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    harness = r"""
+const fs = require('fs');
+const vm = require('vm');
+const source = fs.readFileSync(0, 'utf8');
+const elements = new Map();
+function element() {
+  const classes = new Set();
+  return {
+    innerHTML:'', textContent:'', value:'', disabled:false, style:{}, dataset:{},
+    parentElement:{scrollTop:0}, appendChild(){}, addEventListener(){},
+    querySelector(){return null;}, querySelectorAll(){return [];},
+    classList:{add(c){classes.add(c);}, remove(c){classes.delete(c);},
+      contains(c){return classes.has(c);},
+      toggle(c,on){if(on===undefined)on=!classes.has(c);if(on)classes.add(c);else classes.delete(c);}}
+  };
+}
+const document = {
+  getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id);},
+  createElement:element, addEventListener(){}
+};
+const context = vm.createContext({document,console,AbortController,
+  setTimeout(){return 1;},clearTimeout(){},
+  fetch(){throw new Error('Unexpected fetch in an offline browser test');}});
+vm.runInContext(source, context);
+const run = code => vm.runInContext(code, context);
+(async()=>{
+  const results = {};
+  // SCENARIO
+  process.stdout.write(JSON.stringify(results));
+})().catch(error=>{console.error(error.stack);process.exitCode=1;});
+""".replace("// SCENARIO", scenario)
+    result = subprocess.run(["node", "-e", harness], input=source, text=True, encoding="utf-8",
+                            capture_output=True, cwd=ROOT, timeout=10)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip())
+    return json.loads(result.stdout)
 
 
 # A candidate set standing in for propose.py's output. Hand-written so these
@@ -514,6 +557,23 @@ with patch.object(propose.llm, "cached", return_value={"candidates": [CANDIDATES
     checked_candidates = propose.propose(FINDINGS)
 check("factual candidate reasoning survives validation",
       len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] == CANDIDATES[0]["reasoning"])
+
+
+# ===========================================================================
+section("patient details are rendered as text")
+try:
+    browser_result = browser_checks(r"""
+run(`SETUP={name:'<img src=x onerror="alert(1)"> & Alice',age:'34',gender:'F',
+  caseId:'<svg onload="alert(2)">',languageCode:'en-IN'};paintPatientBar();`);
+const header = elements.get('patientbar').innerHTML;
+results.escaped_name = header.includes('&lt;img') && header.includes('&amp; Alice') && !header.includes('<img');
+results.escaped_case_id = header.includes('&lt;svg') && header.includes('&quot;alert(2)&quot;') && !header.includes('<svg');
+""")
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+check("patient name cannot insert HTML into the header", browser_result.get("escaped_name", False), browser_error)
+check("case ID cannot insert HTML into the header", browser_result.get("escaped_case_id", False), browser_error)
 
 
 # ===========================================================================
