@@ -160,8 +160,8 @@ class Engine:
         self.severity = severity
         self.excluded_by = excluded_by
         # Another name for the SAME rulebook entry, so "Systemic lupus
-        # erythematosus flare" finds the entry written as "SLE". Matched by
-        # the same two rules as the canonical name.
+        # erythematosus flare" finds the entry written as "SLE". Aliases use
+        # containment matching only, never the loose distinctive-word rule.
         self.aliases = dict(aliases or {})
         # token -> the single rated condition whose name contains it, for
         # tokens appearing in exactly one. See match(), rule 2.

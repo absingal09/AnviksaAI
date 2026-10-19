@@ -1,4 +1,4 @@
-"""main.py — the wire. FastAPI, two routes, kept deliberately apart.
+"""main.py — the wire. FastAPI: three POST endpoints, a redirect, and a static mount.
 
     POST /capture   multipart/form-data. STT or OCR, nothing else.
         Either one "audio" file (+ optional "language_code")
@@ -41,10 +41,9 @@ that holds for the rest of the consult) and asked (findings already put to
 the patient, so the panel never re-asks). Candidates, ordering and the next
 question all recompute fresh.
 
-THERE IS NO OFFLINE REPLAY MODE AND NO PRE-COMPUTED PAYLOAD. --offline
-replayed demo/offline_response.json and GET /contract.json served a
-pre-computed engine result; both are gone. They are how a "live" demo kept
-showing canned output that had nothing to do with the person in the room.
+THERE IS NO OFFLINE REPLAY MODE OR PRE-COMPUTED PAYLOAD. Earlier versions
+replayed canned results during supposedly live demos, showing output that
+had nothing to do with the person in the room.
 Everything on screen comes from this patient, this session, or the panel
 says plainly that it has nothing.
 
@@ -56,7 +55,6 @@ Usage:
 import argparse
 import asyncio
 import base64
-import json
 import os
 import sys
 import tempfile

@@ -239,9 +239,9 @@ latency on every single action. Merging them back reintroduces that.
 
 ## The canonical case
 
-`canonical_case.yaml`. It replaced `demo_case.py` and `contract.json`, which
-were written in DDXPlus codes. It is read by tests and by humans and never
-reaches the screen — it is not a demo script, and nothing renders from it.
+`canonical_case.yaml` replaced the old DDXPlus-coded demo fixtures. It is read
+by tests and by humans and never reaches the screen — it is not a demo script,
+and nothing renders from it.
 
 The case that has always exercised this product properly: 34F, sudden chest
 tightness and dyspnoea, a photographed strip revealing a combined oral
