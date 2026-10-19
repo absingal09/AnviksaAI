@@ -95,8 +95,11 @@ const run = code => vm.runInContext(code, context);
   process.stdout.write(JSON.stringify(results));
 })().catch(error=>{console.error(error.stack);process.exitCode=1;});
 """.replace("// SCENARIO", scenario)
-    result = subprocess.run(["node", "-e", harness], input=source, text=True, encoding="utf-8",
-                            capture_output=True, cwd=ROOT, timeout=10)
+    try:
+        result = subprocess.run(["node", "-e", harness], input=source, text=True, encoding="utf-8",
+                                capture_output=True, cwd=ROOT, timeout=10)
+    except FileNotFoundError:
+        sys.exit("Node.js is required for the browser checks")
     if result.returncode:
         raise RuntimeError(result.stderr.strip())
     return json.loads(result.stdout)
@@ -585,6 +588,20 @@ with patch.object(propose.llm, "cached", return_value={"candidates": [CANDIDATES
     checked_candidates = propose.propose(FINDINGS)
 check("factual candidate reasoning survives validation",
       len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] == CANDIDATES[0]["reasoning"])
+
+
+# ===========================================================================
+section("browser checks require Node.js")
+with patch.object(subprocess, "run", side_effect=FileNotFoundError("node is not installed")):
+    try:
+        browser_checks("")
+        missing_node_exit = None
+    except (SystemExit, Exception) as exc:
+        missing_node_exit = exc
+check("missing Node.js exits with a clear prerequisite message",
+      isinstance(missing_node_exit, SystemExit)
+      and missing_node_exit.code == "Node.js is required for the browser checks",
+      str(missing_node_exit))
 
 
 # ===========================================================================
