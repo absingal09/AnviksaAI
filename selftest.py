@@ -709,6 +709,49 @@ catalog_mismatch, mismatch_log = extracted_other({"present": [{"id": "fever", "e
 check("catalog quote mismatches are counted but existing findings and quotes are retained",
       catalog_mismatch[:2] == ({"fever": True}, {"fever": "unmatched quote"})
       and "catalog evidence quote mismatches: 1" in mismatch_log)
+for denial in ("no ringing in my ears", "The patient denies tinnitus.", "I am not hearing ringing.",
+               "I have never had ringing.", "Without ringing in the ears.", "I don't have ringing."):
+    result, log = extracted_other({"other": [{"text": "Tinnitus", "evidence": denial}]}, transcript=denial)
+    check(f"supplemental source negation is rejected and logged: {denial}",
+          result[2] == [] and "negated source quote" in log)
+positive_no, _ = extracted_other({"other": [{"text": "Nosebleeds", "evidence": "I have nosebleeds."}]},
+                                transcript="I have nosebleeds.")
+check("negation matching uses whole words so no inside nosebleeds stays positive", len(positive_no[2]) == 1)
+repeats, repeat_log = extracted_other({"other": [
+    {"text": "Tinnitus ongoing", "evidence": "My ears keep ringing."},
+    {"text": "Tinnitus ongoing", "evidence": "My ears keep ringing."},
+    {"text": "  TINNITUS -- ongoing!!! ", "evidence": "My ears keep ringing."},
+    {"text": "Hiccups", "evidence": "I have hiccups."},
+]}, transcript="My ears keep ringing. I have hiccups.")
+check("exact and case-punctuation-whitespace supplemental repeats count only once",
+      [f["text"] for f in repeats[2]] == ["Tinnitus ongoing", "Hiccups"]
+      and [f["id"] for f in repeats[2]] == ["other:0", "other:1"]
+      and repeat_log.count("duplicate supplemental phrase") == 2)
+catalog_repeat, catalog_repeat_log = extracted_other({
+    "present": [{"id": "fever", "evidence": "I have fever."}],
+    "other": [{"text": "Fever", "evidence": "I have fever."},
+              {"text": "Tinnitus", "evidence": "My ears ring."}],
+}, transcript="I have fever. My ears ring.")
+check("a catalog finding repeated as supplemental is rejected while uncovered facts survive",
+      catalog_repeat[0] == {"fever": True} and [f["text"] for f in catalog_repeat[2]] == ["Tinnitus"]
+      and "overlaps catalog finding fever" in catalog_repeat_log)
+drug_repeat, drug_repeat_log = extracted_other({
+    "present": [{"id": "on_anticoagulant", "evidence": "I take warfarin 5 mg daily."}],
+    "other": [{"text": "Taking warfarin", "evidence": "I take warfarin 5 mg daily."}],
+}, transcript="I take warfarin 5 mg daily.")
+check("a drug repeated from the same catalog evidence is rejected by the overlap heuristic",
+      drug_repeat[2] == [] and "overlaps catalog finding on_anticoagulant" in drug_repeat_log)
+shared_drug_quote = "I take warfarin and acetazolamide."
+shared_drugs, _ = extracted_other({
+    "present": [{"id": "on_anticoagulant", "evidence": shared_drug_quote}],
+    "other": [{"text": "Taking acetazolamide", "evidence": shared_drug_quote}],
+}, transcript=shared_drug_quote)
+check("a shared medication quote does not make every drug a catalog duplicate",
+      len(shared_drugs[2]) == 1)
+cannot_stop, _ = extracted_other({"other": [
+    {"text": "Persistent hiccups", "evidence": "I cannot stop hiccuping."},
+]}, transcript="I cannot stop hiccuping.")
+check("cannot stop describes a positive ongoing symptom", len(cannot_stop[2]) == 1)
 check("empty extended extraction still abstains offline", extract.extract("", include_other=True) == ({}, {}, []))
 check("new extraction schema and prompt participate in the cache version",
       extract._PROMPT_VERSION == llm.content_hash(extract.SYSTEM_PROMPT, json.dumps(extract._TOOL, sort_keys=True),

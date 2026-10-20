@@ -37,6 +37,7 @@ finding no clinician could trace to anything the patient said.
 """
 
 import json
+import re
 
 import llm
 import vocabulary
@@ -319,7 +320,46 @@ def _normalise_quote(text):
     return " ".join(text.casefold().split())
 
 
-def _other_findings(items, sources):
+_NEGATED_QUOTE = re.compile(
+    r"\b(?:no|denies|denied|deny|not|without|never|cannot|negative)\b|\b\w+n['’]t\b",
+    re.IGNORECASE,
+)
+
+
+def _phrase_key(text):
+    """Case/punctuation/whitespace normalisation, not semantic equivalence."""
+    return tuple(re.findall(r"[^\W_]+", text.casefold()))
+
+
+def _catalog_overlap(text, evidence, findings, quotes):
+    """English token-containment heuristic, NOT a clinical synonym resolver.
+
+    Only already-recorded catalog findings participate. The identical-quote
+    check accepts only grammar/dose words beyond the supplemental phrase,
+    so another drug in a shared quote does not become a duplicate by accident.
+    Combined phrases can still overmatch; synonyms can escape. Do not
+    turn this heuristic into new catalog findings or change their states.
+    """
+    stop = {"a", "an", "the", "i", "my", "on", "in", "of", "have", "has", "take", "taking"}
+    words = set(_phrase_key(text)) - stop
+    if not words:
+        return None
+    for fid in findings:
+        for form in (vocabulary.label(fid), fid.replace("_", " ")):
+            covered = set(_phrase_key(form)) - stop
+            if covered and (covered <= words or words <= covered):
+                return fid
+        quote = quotes.get(fid, "")
+        if quote and _normalise_quote(evidence) == _normalise_quote(quote):
+            quoted_words = set(_phrase_key(quote)) - stop
+            dose_words = {"mg", "mcg", "g", "ml", "daily", "tablet", "tablets", "once", "twice"}
+            remainder = quoted_words - words - dose_words
+            if words <= quoted_words and all(word.isdigit() for word in remainder):
+                return fid
+    return None
+
+
+def _other_findings(items, sources, findings=(), quotes=None):
     """Validate a separate positive-evidence channel; never create catalog IDs.
 
     The shared proposal regex checks model-written text only. Source quotes
@@ -327,11 +367,12 @@ def _other_findings(items, sources):
     """
     if not isinstance(items, list):
         return []
-    other = []
+    other, seen = [], set()
     for item in items:
         text = item.get("text") if isinstance(item, dict) else None
         evidence = item.get("evidence") if isinstance(item, dict) else None
         text = " ".join(text.split()) if isinstance(text, str) else ""
+        key = _phrase_key(text)
         reason = None
         if not text or len(text.split()) > 12:
             reason = "missing text or more than twelve words"
@@ -340,12 +381,24 @@ def _other_findings(items, sources):
         elif not isinstance(evidence, str) or not evidence.strip() or not any(
                 _normalise_quote(evidence) in source for source in sources):
             reason = "evidence quote not found verbatim in source"
+        # Conservative English negation heuristic: whole words/contractions,
+        # not substrings (nosebleeds stays positive). Mixed clauses and
+        # "not only" can be false positives; other languages can be missed.
+        # "cannot stop" / "can't stop" instead assert an ongoing symptom.
+        elif _NEGATED_QUOTE.search(re.sub(r"\b(?:cannot|can['’]t)\s+stop\b", "", evidence,
+                                         flags=re.IGNORECASE)):
+            reason = "negated source quote (English heuristic)"
+        elif (covered := _catalog_overlap(text, evidence, findings, quotes or {})):
+            reason = f"overlaps catalog finding {covered} (token heuristic)"
+        elif key in seen:
+            reason = "duplicate supplemental phrase"
         elif len(other) >= 10:
             reason = "more than ten entries"
         if reason:
             print(f"extract: dropped other {text or '<malformed>'!r}: {reason}")
             continue
         other.append({"id": f"other:{len(other)}", "text": text, "evidence": evidence.strip()})
+        seen.add(key)
     return other
 
 
@@ -436,7 +489,7 @@ def extract(transcript, doc_text="", *, include_other=False):
     mismatches = sum(not any(_normalise_quote(quote) in source for source in sources)
                      for quote in quotes.values())
     print(f"extract: catalog evidence quote mismatches: {mismatches}")
-    other = _other_findings(parsed.get("other"), sources)
+    other = _other_findings(parsed.get("other"), sources, findings, quotes)
     return (findings, quotes, other) if include_other else (findings, quotes)
 
 
