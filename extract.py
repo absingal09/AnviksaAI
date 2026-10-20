@@ -37,9 +37,11 @@ finding no clinician could trace to anything the patient said.
 """
 
 import json
+import re
 
 import llm
 import vocabulary
+from propose import _UNSUPPORTED_REASONING
 
 SYSTEM_PROMPT = """You are a clinical scribe. You read a consultation \
 transcript and any documents the patient brought, and you record which \
@@ -71,7 +73,14 @@ calf, a recent flight. Record only what is in the text. You do not know what \
 condition anyone is considering, and that is deliberate.
 
 RULES
-- Use ONLY ids that appear in the catalog. Never invent an id.
+- For present and absent, use ONLY ids that appear in the catalog. Never invent an id.
+- Use a catalog id whenever one fits. Use `other` ONLY for clinically relevant \
+present statements that no catalog finding covers. Never put a denial, an \
+absence, an unknown, or a hypothetical in `other`. Return at most ten entries, \
+each a short clinical phrase in English of at most twelve words, with a quote \
+copied from the transcript or documents. Do not write percentages, probability, \
+likelihood, confidence, or "chance of" claims in the phrase. Keep the evidence \
+quote verbatim, including any numbers or percentages the source contains.
 - Documents count as evidence. A photographed prescription or blister strip \
 naming a drug establishes that the patient takes that drug, even if they \
 never said so out loud. Read the drug name and map it to the right finding \
@@ -153,8 +162,21 @@ _TOOL = {
                         "required": ["id", "evidence"],
                     },
                 },
+                "other": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "description": "Present clinical statements not covered by any catalog finding; never denials or absences.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "Short clinical phrase in English, at most twelve words. Use a catalog id instead whenever one fits."},
+                            "evidence": {"type": "string", "description": "Verbatim quote copied from the transcript or documents."},
+                        },
+                        "required": ["text", "evidence"],
+                    },
+                },
             },
-            "required": ["present", "absent"],
+            "required": ["present", "absent", "other"],
         },
     },
 }
@@ -294,7 +316,93 @@ def _flatten(transcript):
     return transcript or ""
 
 
-def extract(transcript, doc_text=""):
+def _normalise_quote(text):
+    return " ".join(text.casefold().split())
+
+
+_NEGATED_QUOTE = re.compile(
+    r"\b(?:no|denies|denied|deny|not|without|never|cannot|negative)\b|\b\w+n['’]t\b",
+    re.IGNORECASE,
+)
+
+
+def _phrase_key(text):
+    """Case/punctuation/whitespace normalisation, not semantic equivalence."""
+    return tuple(re.findall(r"[^\W_]+", text.casefold()))
+
+
+def _catalog_overlap(text, evidence, findings, quotes):
+    """English token-containment heuristic, NOT a clinical synonym resolver.
+
+    Only already-recorded catalog findings participate. The identical-quote
+    check accepts only grammar/dose words beyond the supplemental phrase,
+    so another drug in a shared quote does not become a duplicate by accident.
+    Combined phrases can still overmatch; synonyms can escape. Do not
+    turn this heuristic into new catalog findings or change their states.
+    """
+    stop = {"a", "an", "the", "i", "my", "on", "in", "of", "have", "has", "take", "taking"}
+    words = set(_phrase_key(text)) - stop
+    if not words:
+        return None
+    for fid in findings:
+        for form in (vocabulary.label(fid), fid.replace("_", " ")):
+            covered = set(_phrase_key(form)) - stop
+            if covered and (covered <= words or words <= covered):
+                return fid
+        quote = quotes.get(fid, "")
+        if quote and _normalise_quote(evidence) == _normalise_quote(quote):
+            quoted_words = set(_phrase_key(quote)) - stop
+            dose_words = {"mg", "mcg", "g", "ml", "daily", "tablet", "tablets", "once", "twice"}
+            remainder = quoted_words - words - dose_words
+            if words <= quoted_words and all(word.isdigit() for word in remainder):
+                return fid
+    return None
+
+
+def _other_findings(items, sources, findings=(), quotes=None):
+    """Validate a separate positive-evidence channel; never create catalog IDs.
+
+    The shared proposal regex checks model-written text only. Source quotes
+    retain doses, durations and percentages exactly as supplied.
+    """
+    if not isinstance(items, list):
+        return []
+    other, seen = [], set()
+    for item in items:
+        text = item.get("text") if isinstance(item, dict) else None
+        evidence = item.get("evidence") if isinstance(item, dict) else None
+        text = " ".join(text.split()) if isinstance(text, str) else ""
+        key = _phrase_key(text)
+        reason = None
+        if not text or len(text.split()) > 12:
+            reason = "missing text or more than twelve words"
+        elif _UNSUPPORTED_REASONING.search(text):
+            reason = "probability wording in generated text"
+        elif not isinstance(evidence, str) or not evidence.strip() or not any(
+                _normalise_quote(evidence) in source for source in sources):
+            reason = "evidence quote not found verbatim in source"
+        # Conservative English negation heuristic: whole words/contractions,
+        # not substrings (nosebleeds stays positive). Mixed clauses and
+        # "not only" can be false positives; other languages can be missed.
+        # "cannot stop" / "can't stop" instead assert an ongoing symptom.
+        elif _NEGATED_QUOTE.search(re.sub(r"\b(?:cannot|can['’]t)\s+stop\b", "", evidence,
+                                         flags=re.IGNORECASE)):
+            reason = "negated source quote (English heuristic)"
+        elif (covered := _catalog_overlap(text, evidence, findings, quotes or {})):
+            reason = f"overlaps catalog finding {covered} (token heuristic)"
+        elif key in seen:
+            reason = "duplicate supplemental phrase"
+        elif len(other) >= 10:
+            reason = "more than ten entries"
+        if reason:
+            print(f"extract: dropped other {text or '<malformed>'!r}: {reason}")
+            continue
+        other.append({"id": f"other:{len(other)}", "text": text, "evidence": evidence.strip()})
+        seen.add(key)
+    return other
+
+
+def extract(transcript, doc_text="", *, include_other=False):
     """-> ({finding_id: True|False}, {finding_id: "quoted evidence"})
 
     The second return value is the quote that justifies each finding. It is
@@ -302,6 +410,10 @@ def extract(transcript, doc_text=""):
     trace a finding back to the words that produced it is a real part of the
     safety net. It is also how a fabricated finding gets caught — a model
     that cannot quote anything for a finding it recorded has invented it.
+
+    With include_other=True, return (findings, quotes, other_findings).
+    The default pair remains compatible with existing catalog-only callers.
+    Supplemental IDs are ephemeral and must never enter catalog state.
     """
     transcript = _flatten(transcript)
     doc_text = doc_text or ""
@@ -310,7 +422,7 @@ def extract(transcript, doc_text=""):
     # model to find findings in an empty string — it costs money, takes
     # seconds, and invites invention.
     if not transcript.strip() and not doc_text.strip():
-        return {}, {}
+        return ({}, {}, []) if include_other else ({}, {})
 
     # The cache key covers EVERYTHING that determines the answer, not just the
     # patient's words. Keying on (model, transcript, doc_text) alone meant
@@ -338,7 +450,7 @@ def extract(transcript, doc_text=""):
     parsed = llm.cached(cpath, produce)
 
     if not isinstance(parsed, dict):
-        return {}, {}
+        return ({}, {}, []) if include_other else ({}, {})
     findings, quotes, dropped = {}, {}, []
     recorded_states = {}
     for state, key in ((True, "present"), (False, "absent")):
@@ -373,7 +485,12 @@ def extract(transcript, doc_text=""):
     if dropped:
         print(f"extract: dropped {len(dropped)} id(s) not in findings.yaml: {sorted(set(dropped))}")
 
-    return findings, quotes
+    sources = [_normalise_quote(transcript), _normalise_quote(doc_text)]
+    mismatches = sum(not any(_normalise_quote(quote) in source for source in sources)
+                     for quote in quotes.values())
+    print(f"extract: catalog evidence quote mismatches: {mismatches}")
+    other = _other_findings(parsed.get("other"), sources, findings, quotes)
+    return (findings, quotes, other) if include_other else (findings, quotes)
 
 
 if __name__ == "__main__":

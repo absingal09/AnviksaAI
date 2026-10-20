@@ -1,4 +1,4 @@
-"""Manual live case checks; never imported by selftest.py or run by CI.
+"""Manual live case checks; never executed by selftest.py or CI.
 
     python run_cases.py
     python run_cases.py pe_masquerading_as_panic
@@ -58,15 +58,19 @@ def load_cases():
 
 
 def number_issues(value, path="output"):
-    """Find numbers or score fields in the public engine payload.
+    """Find numeric scores or probability wording in generated payload fields.
 
-    Private evidence quotes may legitimately contain doses or durations and
-    are not displayed by the clinician panels, so they are excluded here.
+    Internal ids and verbatim evidence are not generated clinical claims.
+    Ordinary clinical digits are allowed; numeric scalar fields, score keys,
+    percentages and probability claims remain forbidden. Keep scanning labels,
+    reasoning, notes and supplemental text, rather than skipping whole panels.
     """
+    from propose import _UNSUPPORTED_REASONING
+
     issues = []
     if isinstance(value, dict):
         for key, item in value.items():
-            if key.startswith("_"):
+            if key.startswith("_") or key in {"id", "finding", "evidence"}:
                 continue
             if key in {"p", "probability", "score", "confidence", "entropy", "risk", "weighted", "priority_score"}:
                 issues.append(f"{path}.{key}")
@@ -76,7 +80,9 @@ def number_issues(value, path="output"):
             issues.extend(number_issues(item, f"{path}[{index}]"))
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         issues.append(path)
-    elif isinstance(value, str) and re.search(r"\d", value):
+    elif isinstance(value, str) and (
+            _UNSUPPORTED_REASONING.search(value)
+            or re.search(r"\b(?:score|risk|odds)\s*[:=]?\s*\d", value, re.IGNORECASE)):
         issues.append(path)
     return issues
 
@@ -173,11 +179,12 @@ def main():
         print(f"\nCase: {case_id} — {case['case'].get('summary', '')}")
         try:
             # Same extract -> propose -> triage sequence as main.py /analyze.
-            findings, quotes = extract.extract(case["input"]["transcript"], case["input"]["document_text"])
-            candidates = propose.propose(findings)
-            payload = engine.assess(candidates, findings, confirmed_exclusions=(), asked=())
+            findings, quotes, other = extract.extract(case["input"]["transcript"], case["input"]["document_text"], include_other=True)
+            candidates = propose.propose(findings, other)
+            payload = engine.assess(candidates, findings, confirmed_exclusions=(), asked=(), other_findings=other)
             payload["_findings"] = findings
             payload["_quotes"] = quotes
+            payload["other_findings"] = other
             passed += check_expectations(case, findings, payload, engine)
         except Exception as exc:
             print(f"FAIL {case_id}: pipeline/check error ({type(exc).__name__}): {exc}")

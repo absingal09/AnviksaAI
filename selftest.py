@@ -653,17 +653,240 @@ check("malformed screening output keeps the document visibly unscreened",
 
 
 # ===========================================================================
+section("supplemental findings have source-backed quotes and stay separate")
+
+
+def extracted_other(response, transcript="My eyelid keeps twitching.", document=""):
+    output = io.StringIO()
+    with patch.object(llm, "cached", return_value=response), patch("sys.stdout", output):
+        result = extract.extract(transcript, document, include_other=True)
+    return result, output.getvalue()
+
+
+supplemental_response = {"present": [], "absent": [], "other": [
+    {"text": "Eyelid twitching", "evidence": "My eyelid keeps twitching."},
+]}
+supplemental, supplemental_log = extracted_other(supplemental_response)
+check("a verbatim supplemental quote is kept outside the catalog dict and quotes",
+      supplemental == ({}, {}, [{"id": "other:0", "text": "Eyelid twitching",
+                                "evidence": "My eyelid keeps twitching."}]))
+check("the supplemental schema caps entries and requires text and quoted evidence",
+      extract._TOOL["function"]["parameters"]["properties"]["other"]["maxItems"] == 10
+      and extract._TOOL["function"]["parameters"]["properties"]["other"]["items"]["required"] == ["text", "evidence"]
+      and "Never put a denial" in extract.SYSTEM_PROMPT)
+normalised, _ = extracted_other({"other": [{"text": "Eyelid twitching", "evidence": "MY eyelid\nkeeps twitching."}]},
+                                 document="My  eyelid keeps\t twitching.", transcript="")
+check("supplemental quote verification normalises only whitespace and case and reads documents",
+      len(normalised[2]) == 1 and normalised[2][0]["evidence"] == "MY eyelid\nkeeps twitching.")
+unquoted, unquoted_log = extracted_other({"other": [{"text": "Eyelid twitching", "evidence": "Her eyelid twitches."}]})
+check("a paraphrased supplemental quote is dropped and its generated text is logged",
+      unquoted[2] == [] and "Eyelid twitching" in unquoted_log and "not found verbatim" in unquoted_log)
+cross_source, _ = extracted_other({"other": [{"text": "Eyelid twitching", "evidence": "eyelid twitching"}]},
+                                  transcript="eyelid", document="twitching")
+check("a supplemental quote cannot be assembled across transcript and document boundaries", cross_source[2] == [])
+for unsafe in ["95% chance of eyelid twitching", "Probability of twitching", "High likelihood",
+               "High confidence", "A chance of twitching", "Ten percent", "P(twitching)"]:
+    rejected, rejection_log = extracted_other({"other": [{"text": unsafe, "evidence": "My eyelid keeps twitching."}]})
+    check(f"supplemental generated probability wording is dropped and logged: {unsafe}",
+          rejected[2] == [] and unsafe in rejection_log and "probability wording" in rejection_log)
+numeric_source = "My eyelid twitches 5 times; a note says 95% probability."
+numeric_other, _ = extracted_other({"other": [{"text": "Eyelid twitches 5 times", "evidence": numeric_source}]},
+                                   transcript=numeric_source)
+check("digits in supplemental text and probability wording in verbatim quotes are retained",
+      numeric_other[2] == [{"id": "other:0", "text": "Eyelid twitches 5 times", "evidence": numeric_source}])
+malformed_other, malformed_log = extracted_other({"other": [None, {}, {"text": 9, "evidence": []},
+    {"text": " ", "evidence": "My eyelid keeps twitching."},
+    {"text": " ".join(["word"] * 13), "evidence": "My eyelid keeps twitching."},
+    supplemental_response["other"][0]]})
+check("malformed and overlong supplemental entries do not crash or displace valid entries",
+      malformed_other[2] == supplemental[2] and "dropped other" in malformed_log)
+capped_other, capped_log = extracted_other({"other": [dict(supplemental_response["other"][0], text=f"Eyelid twitching {n}")
+                                                       for n in range(11)]})
+check("supplemental entries are capped in code with ephemeral IDs and excess entries are logged",
+      len(capped_other[2]) == 10 and capped_other[2][-1]["id"] == "other:9"
+      and "Eyelid twitching 10" in capped_log)
+catalog_mismatch, mismatch_log = extracted_other({"present": [{"id": "fever", "evidence": "unmatched quote"}]})
+check("catalog quote mismatches are counted but existing findings and quotes are retained",
+      catalog_mismatch[:2] == ({"fever": True}, {"fever": "unmatched quote"})
+      and "catalog evidence quote mismatches: 1" in mismatch_log)
+for denial in ("no ringing in my ears", "The patient denies tinnitus.", "I am not hearing ringing.",
+               "I have never had ringing.", "Without ringing in the ears.", "I don't have ringing."):
+    result, log = extracted_other({"other": [{"text": "Tinnitus", "evidence": denial}]}, transcript=denial)
+    check(f"supplemental source negation is rejected and logged: {denial}",
+          result[2] == [] and "negated source quote" in log)
+positive_no, _ = extracted_other({"other": [{"text": "Nosebleeds", "evidence": "I have nosebleeds."}]},
+                                transcript="I have nosebleeds.")
+check("negation matching uses whole words so no inside nosebleeds stays positive", len(positive_no[2]) == 1)
+repeats, repeat_log = extracted_other({"other": [
+    {"text": "Tinnitus ongoing", "evidence": "My ears keep ringing."},
+    {"text": "Tinnitus ongoing", "evidence": "My ears keep ringing."},
+    {"text": "  TINNITUS -- ongoing!!! ", "evidence": "My ears keep ringing."},
+    {"text": "Hiccups", "evidence": "I have hiccups."},
+]}, transcript="My ears keep ringing. I have hiccups.")
+check("exact and case-punctuation-whitespace supplemental repeats count only once",
+      [f["text"] for f in repeats[2]] == ["Tinnitus ongoing", "Hiccups"]
+      and [f["id"] for f in repeats[2]] == ["other:0", "other:1"]
+      and repeat_log.count("duplicate supplemental phrase") == 2)
+catalog_repeat, catalog_repeat_log = extracted_other({
+    "present": [{"id": "fever", "evidence": "I have fever."}],
+    "other": [{"text": "Fever", "evidence": "I have fever."},
+              {"text": "Tinnitus", "evidence": "My ears ring."}],
+}, transcript="I have fever. My ears ring.")
+check("a catalog finding repeated as supplemental is rejected while uncovered facts survive",
+      catalog_repeat[0] == {"fever": True} and [f["text"] for f in catalog_repeat[2]] == ["Tinnitus"]
+      and "overlaps catalog finding fever" in catalog_repeat_log)
+drug_repeat, drug_repeat_log = extracted_other({
+    "present": [{"id": "on_anticoagulant", "evidence": "I take warfarin 5 mg daily."}],
+    "other": [{"text": "Taking warfarin", "evidence": "I take warfarin 5 mg daily."}],
+}, transcript="I take warfarin 5 mg daily.")
+check("a drug repeated from the same catalog evidence is rejected by the overlap heuristic",
+      drug_repeat[2] == [] and "overlaps catalog finding on_anticoagulant" in drug_repeat_log)
+shared_drug_quote = "I take warfarin and acetazolamide."
+shared_drugs, _ = extracted_other({
+    "present": [{"id": "on_anticoagulant", "evidence": shared_drug_quote}],
+    "other": [{"text": "Taking acetazolamide", "evidence": shared_drug_quote}],
+}, transcript=shared_drug_quote)
+check("a shared medication quote does not make every drug a catalog duplicate",
+      len(shared_drugs[2]) == 1)
+cannot_stop, _ = extracted_other({"other": [
+    {"text": "Persistent hiccups", "evidence": "I cannot stop hiccuping."},
+]}, transcript="I cannot stop hiccuping.")
+check("cannot stop describes a positive ongoing symptom", len(cannot_stop[2]) == 1)
+check("empty extended extraction still abstains offline", extract.extract("", include_other=True) == ({}, {}, []))
+check("new extraction schema and prompt participate in the cache version",
+      extract._PROMPT_VERSION == llm.content_hash(extract.SYSTEM_PROMPT, json.dumps(extract._TOOL, sort_keys=True),
+          json.dumps(vocabulary.catalog_for_prompt(), sort_keys=True, ensure_ascii=False))
+      and extract._PROMPT_VERSION != llm.content_hash(extract.SYSTEM_PROMPT,
+          json.dumps({"without": "other"}, sort_keys=True),
+          json.dumps(vocabulary.catalog_for_prompt(), sort_keys=True, ensure_ascii=False)))
+
+
+# ===========================================================================
+section("supplemental proposal evidence stays outside catalog state")
+
+other_evidence = [{"id": "other:0", "text": "Eyelid twitches 5 times", "evidence": "PRIVATE_QUOTE 95% probability"}]
+other_candidate = {"condition": "Eyelid myokymia", "reasoning": "Eyelid twitching persists.",
+                   "supported_by": ["other:0", "other:99"], "opposed_by": ["other:0"],
+                   "unresolved": ["other:0", "calf_swelling_unilateral"]}
+
+
+def proposed_other(items, candidate=other_candidate):
+    keys = []
+
+    def invoke(path, produce):
+        keys.append(str(path))
+        return produce()
+
+    with patch.object(llm, "cached", side_effect=invoke), \
+            patch.object(llm, "call_tool", return_value={"candidates": [candidate]}) as call, \
+            patch("sys.stdout", io.StringIO()):
+        result = propose.propose({}, items)
+    return result, call, keys
+
+
+other_candidates, other_call, other_keys = proposed_other(other_evidence)
+check("supplemental-only evidence reaches proposal as a present text list without source quotes",
+      other_call.call_count == 1 and "ALSO NOTED, NOT IN VOCABULARY" in other_call.call_args.args[1]
+      and "other:0  (Eyelid twitches 5 times)" in other_call.call_args.args[1]
+      and "PRIVATE_QUOTE" not in other_call.call_args.args[1]
+      and "95% probability" not in other_call.call_args.args[1])
+check("proposal keeps existing supplemental support and drops nonexistent supplemental references",
+      len(other_candidates) == 1 and other_candidates[0]["supported_by"] == ["other:0"])
+check("supplemental ids cannot become opposed or unknown proposal findings",
+      other_candidates[0]["opposed_by"] == []
+      and other_candidates[0]["unresolved"] == ["calf_swelling_unilateral"])
+other_triage = eng.assess(other_candidates, {}, other_findings=other_evidence)
+check("supplemental-only candidates do not abstain and unlisted conditions stay unrated",
+      other_triage["abstaining"] is False and len(other_triage["unrated"]) == 1
+      and other_triage["unrated"][0]["severity_band"] == "unrated")
+check("supplemental support chips use clinical text instead of the ephemeral id",
+      other_triage["unrated"][0]["supported_by"] == [{"finding": "other:0", "label": "Eyelid twitches 5 times"}])
+check("supplemental evidence never enters catalog state or unknown-finding checks",
+      other_triage["findings_present"] == other_triage["findings_absent"] == other_triage["doesnt_fit"] == []
+      and "other:0" not in vocabulary.FINDINGS)
+check("supplemental ids never supply the next question or its asked tracking",
+      other_triage["next_question"]["finding"] == "calf_swelling_unilateral"
+      and eng.assess(other_candidates, {}, asked=["calf_swelling_unilateral"], other_findings=other_evidence)["next_question"] is None)
+rogue_other = dict(other_candidate, unresolved=["other:0"], opposed_by=["other:0"], supported_by=["other:99"])
+rogue_payload = eng.assess([rogue_other], {}, other_findings=other_evidence)
+check("triage defensively drops invalid supplemental support and never asks about supplemental evidence",
+      rogue_payload["next_question"] is None and rogue_payload["unrated"][0]["supported_by"] == []
+      and rogue_payload["unrated"][0]["opposed_by"] == [])
+other_pe = dict(other_candidates[0], condition="Pulmonary embolism", unresolved=[])
+unconfirmed_other = eng.assess([other_pe], {}, other_findings=other_evidence)
+confirmed_other = eng.assess([other_pe], {}, confirmed_exclusions=["Acute pulmonary embolism"], other_findings=other_evidence)
+check("supplemental evidence cannot exclude a condition without clinician confirmation",
+      len(unconfirmed_other["cant_miss"]) == 1 and unconfirmed_other["ruled_out"] == []
+      and unconfirmed_other["cant_miss"][0]["exclusion_options"] == eng.exclusion_options("Pulmonary embolism")
+      and not any("other:" in json.dumps(option) for option in unconfirmed_other["cant_miss"][0]["exclusion_options"])
+      and confirmed_other["cant_miss"] == [] and len(confirmed_other["ruled_out"]) == 1)
+expanded_candidates, _, _ = proposed_other(other_evidence, dict(other_candidate, reasoning="other:0 was noted; other:99 is unavailable."))
+check("supplemental citations in generated prose expand to text and never leak internal ids",
+      "other:" not in expanded_candidates[0]["reasoning"]
+      and "Eyelid twitches 5 times" in expanded_candidates[0]["reasoning"])
+_, _, changed_other_keys = proposed_other([dict(other_evidence[0], text="Persistent eyelid twitching")])
+_, _, changed_quote_keys = proposed_other([dict(other_evidence[0], evidence="DIFFERENT PRIVATE QUOTE")])
+check("proposal caches include supplemental ids and text but never source quotes",
+      other_keys != changed_other_keys and other_keys == changed_quote_keys)
+check("proposal schema and prompt invalidate its version alongside finding labels",
+      propose._PROMPT_VERSION == llm.content_hash(propose.SYSTEM_PROMPT, json.dumps(propose._TOOL, sort_keys=True),
+          json.dumps({fid: meta["label"] for fid, meta in vocabulary.FINDINGS.items()}, sort_keys=True, ensure_ascii=False)))
+
+
+# Provider tool-schema fixture: the documented nested string-enum shape. This
+# proves what we send, not that a remote provider enforces it (live check separate).
+enum_properties = other_call.call_args.args[2]["function"]["parameters"]["properties"]["candidates"]["items"]["properties"]
+for role in ("supported_by", "opposed_by", "unresolved"):
+    expected_ids = set(vocabulary.FINDINGS) | ({"other:0"} if role == "supported_by" else set())
+    check(f"proposal {role} schema restricts references to its catalog and supplemental enum",
+          set(enum_properties[role]["items"].get("enum", [])) == expected_ids)
+counted_response = {"candidates": [{"condition": "Offline condition",
+    "supported_by": ["fever", "other:0", "phantom_present", "cough"],
+    "opposed_by": ["cough", "fever", "phantom_absent"],
+    "unresolved": ["calf_swelling_unilateral", "phantom_unknown", "other:0"]}]}
+with patch.object(llm, "cached", return_value=counted_response), patch("sys.stdout", io.StringIO()) as id_log:
+    counted = propose.propose({"fever": True, "cough": False}, other_evidence)
+check("invalid proposal IDs are counted per run, distinguishing unknown from wrong-state references",
+      "propose: dropped IDs: 6 (unknown: 3, wrong state: 3)" in id_log.getvalue()
+      and counted[0]["supported_by"] == ["fever", "other:0"]
+      and counted[0]["opposed_by"] == ["cough"]
+      and counted[0]["unresolved"] == ["calf_swelling_unilateral"])
+with patch.object(llm, "cached", return_value={"candidates": []}), patch("sys.stdout", io.StringIO()) as zero_log:
+    propose.propose({"fever": True})
+    propose.propose({})
+check("proposal runs with no dropped IDs, including abstention, explicitly log zero",
+      zero_log.getvalue().count("propose: dropped IDs: 0 (unknown: 0, wrong state: 0)") == 2)
+
+
+# ===========================================================================
+section("reasoning uses only linked structured findings")
+reasoning_source = "for 3 days my ears have been ringing, and I have had hiccups since this morning."
+reasoning_response = {"present": [], "absent": [], "other": [
+    {"text": "Ringing in the ears for 3 days", "evidence": "for 3 days my ears have been ringing"},
+    {"text": "Hiccups since this morning", "evidence": "I have had hiccups since this morning."},
+]}
+reasoning_findings, _ = extracted_other(reasoning_response, transcript=reasoning_source)
+for invented in ("Recent viral illness with new tinnitus.", "Persistent unilateral tinnitus.",
+                 "Left ear tinnitus after a viral illness.", "Right ear tinnitus with hiccups."):
+    fixture = dict(other_candidate, reasoning=invented, supported_by=["other:0", "other:1"], unresolved=[])
+    grounded, _, _ = proposed_other(reasoning_findings[2], fixture)
+    text = grounded[0]["reasoning"] if grounded else ""
+    check(f"exact ringing-ears source cannot gain unsupported claims: {invented}",
+          bool(text) and not re.search(r"\b(?:viral|unilateral|left|right)\b", text, re.I)
+          and "Ringing in the ears for 3 days" in text and "Hiccups since this morning" in text)
+with patch.object(llm, "cached", return_value={"candidates": [dict(other_candidate, reasoning="", supported_by=[], unresolved=[])]}):
+    unlinked = propose.propose({}, other_evidence)
+check("a candidate without linked support gets an explicit neutral template instead of invented facts",
+      len(unlinked) == 1 and unlinked[0]["reasoning"] == "No supporting findings were linked to this candidate.")
+
+
+# ===========================================================================
 section("candidate reasoning does not invent certainty")
-withheld_reasoning = "Reasoning withheld: the model used numeric or probability wording."
-
-
 def reasoning_payload_is_clean(candidates):
     payload = json.dumps(eng.assess(candidates, FINDINGS), ensure_ascii=False)
-    # The fixed withholding notice explains the removal; it is not a model claim.
-    model_text = payload.replace(withheld_reasoning, "")
     return not re.search(
         r"[%％]|\b(?:percent(?:age)?|per\s+cent|probabilit(?:y|ies)|likelihood|confidence)\b"
-        r"|\bchance\s+of\b|\bp\s*(?:=|\()|\b\d+\.\d+\b", model_text, re.I)
+        r"|\bchance\s+of\b|\bp\s*(?:=|\()|\b\d+\.\d+\b", payload, re.I)
 
 
 for unsafe_reasoning in ["A 95% chance of PE", "The probability of PE is high.",
@@ -672,8 +895,11 @@ for unsafe_reasoning in ["A 95% chance of PE", "The probability of PE is high.",
     response = {"candidates": [dict(CANDIDATES[0], reasoning=unsafe_reasoning), CANDIDATES[1]]}
     with patch.object(propose.llm, "cached", return_value=response):
         checked_candidates = propose.propose(FINDINGS)
-    check(f"unsafe reasoning is withheld without losing its candidate: {unsafe_reasoning}",
-          checked_candidates == [dict(CANDIDATES[0], reasoning=withheld_reasoning), CANDIDATES[1]])
+    check(f"provider probability prose is ignored without losing candidates or evidence: {unsafe_reasoning}",
+          len(checked_candidates) == 2
+          and [c["condition"] for c in checked_candidates] == [c["condition"] for c in CANDIDATES[:2]]
+          and checked_candidates[0]["supported_by"] == CANDIDATES[0]["supported_by"]
+          and checked_candidates[0]["reasoning"].startswith("Linked present findings:"))
     check(f"unsupported claim cannot reach the payload: {unsafe_reasoning}",
           reasoning_payload_is_clean(checked_candidates))
 
@@ -681,15 +907,17 @@ mixed_reasoning = "A 95% chance of PE. Sudden breathlessness after a long journe
 with patch.object(propose.llm, "cached", return_value={
         "candidates": [dict(CANDIDATES[0], reasoning=mixed_reasoning)]}):
     checked_candidates = propose.propose(FINDINGS)
-check("only the unsupported sentence is removed, preserving candidate evidence",
-      checked_candidates == [dict(CANDIDATES[0], reasoning="Sudden breathlessness after a long journey.")])
+check("all mixed provider prose is replaced by a template retaining linked evidence",
+      len(checked_candidates) == 1 and checked_candidates[0]["supported_by"] == CANDIDATES[0]["supported_by"]
+      and checked_candidates[0]["reasoning"].startswith("Linked present findings:"))
 check("mixed reasoning cannot leak a percentage or probability claim into the payload",
       reasoning_payload_is_clean(checked_candidates))
 
 with patch.object(propose.llm, "cached", return_value={"candidates": [CANDIDATES[0]]}):
     checked_candidates = propose.propose(FINDINGS)
-check("factual candidate reasoning survives validation",
-      len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] == CANDIDATES[0]["reasoning"])
+check("the factual template contains exactly the linked present findings",
+      len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] ==
+      "Linked present findings: " + "; ".join(vocabulary.label(f) for f in CANDIDATES[0]["supported_by"]) + ".")
 
 
 # ===========================================================================
@@ -1092,7 +1320,7 @@ with patch.dict(os.environ, {}, clear=True):
         check("unknown chat model names fail before a paid request", invalid_model_rejected)
 
 
-def offline_v2(replies, *, task="extract"):
+def offline_v2(replies, *, task="extract", tool=None):
     requests = []
 
     def respond(request):
@@ -1106,7 +1334,7 @@ def offline_v2(replies, *, task="extract"):
             patch.object(llm.time, "sleep"), \
             patch.dict(os.environ, {"SARVAM_API_KEY": "offline-test-key"}, clear=True):
         try:
-            return llm.call_tool("offline system", "offline input", extract._SCREEN_TOOL, task=task), requests, None
+            return llm.call_tool("offline system", "offline input", tool or extract._SCREEN_TOOL, task=task), requests, None
         except Exception as exc:
             return None, requests, exc
 
@@ -1122,6 +1350,16 @@ check("GLM uses the V2 endpoint with an explicit reasoning budget",
       and body["model"] == "glm5.3" and body["reasoning_effort"] == "high"
       and body["max_tokens"] == 16384 and body["temperature"] == 0 and body["seed"] == 0
       and body["tool_choice"]["function"]["name"] == extract._SCREEN_TOOL["function"]["name"])
+proposal_enum_tool = other_call.call_args.args[2]
+enum_reply = {"choices": [{"message": {"tool_calls": [{"function": {
+    "name": "propose_candidates", "arguments": json.dumps({"candidates": [dict(other_candidate,
+        supported_by=["other:0"], opposed_by=[], unresolved=["calf_swelling_unilateral"])]}),
+}}]}}]}
+enum_result, enum_requests, enum_error = offline_v2([(200, enum_reply)], task="propose", tool=proposal_enum_tool)
+check("the real V2 transport preserves nested proposal string enums and parses structured arguments",
+      enum_error is None and enum_requests[0][1]["tools"] == [proposal_enum_tool]
+      and enum_requests[0][1]["tool_choice"]["function"]["name"] == "propose_candidates"
+      and enum_result["candidates"][0]["supported_by"] == ["other:0"])
 result, requests, error = offline_v2([(200, v2_success)], task="screen")
 check("Gemma screening keeps its separate short nonreasoning request",
       result == screen_arguments and requests[0][1]["model"] == "gemma4"
@@ -1227,7 +1465,7 @@ with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-unrated-")
     log_path = Path(log_test_dir) / "cache" / "unrated_log.jsonl"
     request = main.AnalyzeRequest(transcript="PRIVATE_TRANSCRIPT", doc_text="PRIVATE_DOCUMENT")
     with patch.object(main, "REPO_ROOT", Path(log_test_dir)), \
-            patch.object(main.extract, "extract", return_value=(FINDINGS, {"breathlessness": "PRIVATE_QUOTE"})), \
+            patch.object(main.extract, "extract", return_value=(FINDINGS, {"breathlessness": "PRIVATE_QUOTE"}, [])), \
             patch.object(main.propose, "propose", return_value=[CANDIDATES[-1]]):
         logged_payload = main._pipeline(request)
         records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()] if log_path.exists() else []
@@ -1255,6 +1493,137 @@ with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-unrated-")
                 failed_log_payload, error = {}, str(exc)
         check("a log write failure is reported without hiding the clinical panel",
               not error and bool(failed_log_payload.get("unrated")) and "log" in log_error.getvalue().lower(), error or log_error.getvalue())
+
+
+# ===========================================================================
+section("supplemental evidence reaches the API and escaped clinician panels")
+
+
+async def exercise_supplemental_pipeline():
+    source = "My eyelid twitches <b>x</b> 5 times; SOURCE_ONLY 95% probability."
+    phrase = "Eyelid twitching <b>x</b> 5 times"
+    proposed_inputs, extraction_keys, assessment_calls = [], [], []
+    invalid_quote = False
+
+    def response(system, user, tool, *, task):
+        if task == "extract":
+            return {"present": [], "absent": [], "other": [{
+                "text": phrase if not invalid_quote else "Unquoted twitching",
+                "evidence": source if not invalid_quote else "This was never said.",
+            }]}
+        if task != "propose":
+            raise AssertionError("Unexpected model task in offline test")
+        proposed_inputs.append(user)
+        return {"candidates": [{
+            "condition": "Eyelid myokymia",
+            "reasoning": "other:0 was reported. A 95% chance of recovery.",
+            "supported_by": ["other:0", "other:99"], "opposed_by": ["other:0"],
+            "unresolved": ["other:0", "calf_swelling_unilateral"],
+        }]}
+
+    def cached(path, produce):
+        extraction_keys.append(str(path))
+        return produce()
+
+    original_assess = eng.assess
+
+    def assess(*args, **kwargs):
+        assessment_calls.append((args, kwargs))
+        return original_assess(*args, **kwargs)
+
+    logs = io.StringIO()
+    with patch.object(llm, "cached", side_effect=cached), patch.object(llm, "call_tool", side_effect=response), \
+            patch.object(main, "get_engine", return_value=eng), patch.object(eng, "assess", side_effect=assess), \
+            patch.object(main, "_log_unrated"), patch("sys.stdout", logs):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+            result = await client.post("/analyze", json={"doc_text": source, "asked": ["other:0", "calf_swelling_unilateral"]})
+            invalid_quote = True
+            rejected = await client.post("/analyze", json={"transcript": source})
+    return result, rejected, proposed_inputs, assessment_calls, logs.getvalue(), source, phrase
+
+
+api_other, api_rejected, api_proposal_inputs, api_assessments, api_other_log, api_source, api_phrase = asyncio.run(exercise_supplemental_pipeline())
+api_payload = api_other.json()
+check("analyze returns validated supplemental evidence with its verbatim numeric quote",
+      api_other.status_code == 200
+      and api_payload["other_findings"] == [{"id": "other:0", "text": api_phrase, "evidence": api_source}])
+check("an other-only consultation reaches proposal and returns candidates without abstaining",
+      len(api_proposal_inputs) == 1 and not api_payload["abstaining"] and bool(api_payload["unrated"])
+      and api_payload["_findings"] == api_payload["_quotes"] == {}
+      and "SOURCE_ONLY" not in api_proposal_inputs[0] and api_source not in api_proposal_inputs[0])
+check("analyze passes only catalog ids into asked tracking and no supplemental exclusion state",
+      api_assessments[0][1]["asked"] == ["calf_swelling_unilateral"]
+      and api_assessments[0][1]["confirmed_exclusions"] == []
+      and api_assessments[0][0][1] == {} and api_payload["next_question"] is None
+      and api_payload["findings_present"] == api_payload["findings_absent"] == [])
+check("an unquoted supplemental claim is omitted from the API and logged without proposing from it",
+      api_rejected.status_code == 200 and api_rejected.json()["other_findings"] == []
+      and api_rejected.json()["abstaining"] and "Unquoted twitching" in api_other_log)
+generated_other = [api_payload["other_findings"][0]["text"], api_payload["unrated"][0]["reasoning"],
+                   api_payload["unrated"][0]["supported_by"][0]["label"]]
+check("supplemental generated text contains no percentages or probability wording while quotes remain untouched",
+      all(not propose._UNSUPPORTED_REASONING.search(value) for value in generated_other)
+      and "95% probability" in api_payload["other_findings"][0]["evidence"]
+      and "5" in api_payload["other_findings"][0]["text"])
+
+# Load definitions only: never invoke run_cases.main() or any live case.
+case_helpers = runpy.run_path(str(ROOT / "run_cases.py"), run_name="offline_case_helpers")
+number_issues = case_helpers["number_issues"]
+check("manual case checks ignore internal ids and verbatim evidence but permit ordinary clinical digits",
+      not number_issues(api_payload)
+      and not number_issues({"id": "other:95", "finding": "other:95", "evidence": "95% probability", "text": "Twitches 5 times"}))
+for field, value in [("label", "95%"), ("reasoning", "A chance of recovery"),
+                     ("note", "High confidence"), ("text", "High probability"),
+                     ("note", "Risk score 95"), ("score", 5), ("weight", 0.5)]:
+    check(f"manual case checks still inspect generated {field}: {value}", bool(number_issues({field: value})))
+
+try:
+    browser_result = browser_checks(r"""
+const payload = PAYLOAD;
+run('committed=false;hasLiveInput=true;');context.payload=payload;
+run('dxState={stage:payload};cmState={stage:payload};paintDX();');
+results.hidden_without_note=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+run('committed=true;hasLiveInput=false;paintDX();');
+results.hidden_without_input=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+run('committed=true;hasLiveInput=true;paintDX();paintCM();paintQB();paintMIS();');
+const html=elements.get('other-findings').innerHTML;
+results.visible_and_escaped=!elements.get('other-card').classList.contains('hide')
+  && (html.match(/&lt;b&gt;x&lt;\/b&gt;/g)||[]).length===2 && !html.includes('<b>x</b>')
+  && html.includes('5 times') && html.includes('95% probability');
+results.support_label=elements.get('dx').innerHTML.includes('Eyelid twitching &lt;b&gt;x&lt;/b&gt; 5 times');
+results.no_displayed_ids=[...elements.values()].every(el=>!el.innerHTML.includes('other:') && !el.textContent.includes('other:'));
+run('setAnalysisError("offline failure")');
+results.stale=elements.get('other-findings').classList.contains('analysis-stale');
+run(`dxState.stage.next_question={finding:'other:0',ask:'other:0'};paintQB();`);
+results.no_supplemental_question=!elements.get('qbody').innerHTML.includes('other:') && run('askedFindings.length===0');
+let sent;
+context.fetch=async(url,options)=>{sent=JSON.parse(options.body);return {ok:true,json:async()=>payload};};
+run(`askedFindings=['other:0','calf_swelling_unilateral'];liveTranscriptExtra='My eyelid twitches.';`);
+await run('runAnalyze()');
+results.no_supplemental_asked=JSON.stringify(sent.asked)===JSON.stringify(['calf_swelling_unilateral']);
+run("scannedDocs=[];liveTranscriptExtra='';");await run('runAnalyze()');
+results.cleared_without_evidence=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+run('dxState={stage:payload};paintDX();reset();');
+results.reset_clears=elements.get('other-card').classList.contains('hide') && elements.get('other-findings').innerHTML==='';
+""".replace("PAYLOAD", json.dumps(api_payload)))
+    browser_error = ""
+except Exception as exc:
+    browser_result, browser_error = {}, str(exc)
+check("the supplemental section has an explicit outside-the-standard-list label",
+      "Also noted, outside the standard list" in (ROOT / "web/index.html").read_text(encoding="utf-8"))
+for key, description in [
+    ("hidden_without_note", "supplemental evidence stays hidden until the clinician note is committed"),
+    ("hidden_without_input", "supplemental evidence stays hidden without real input"),
+    ("visible_and_escaped", "supplemental text and verbatim quotes both escape HTML while retaining clinical numbers"),
+    ("support_label", "candidate support rows show the supplemental text"),
+    ("no_displayed_ids", "other: never appears anywhere in the rendered page"),
+    ("stale", "failed analysis marks supplemental evidence as stale with the other panels"),
+    ("no_supplemental_question", "even a malformed supplemental question cannot render or enter asked tracking"),
+    ("no_supplemental_asked", "analysis requests omit supplemental ids from asked tracking"),
+    ("cleared_without_evidence", "removing all evidence clears the supplemental section"),
+    ("reset_clears", "reset clears supplemental evidence"),
+]:
+    check(description, browser_result.get(key, False), browser_error)
 
 
 # ===========================================================================
