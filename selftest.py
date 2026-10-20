@@ -833,6 +833,31 @@ check("proposal schema and prompt invalidate its version alongside finding label
           json.dumps({fid: meta["label"] for fid, meta in vocabulary.FINDINGS.items()}, sort_keys=True, ensure_ascii=False)))
 
 
+# Provider tool-schema fixture: the documented nested string-enum shape. This
+# proves what we send, not that a remote provider enforces it (live check separate).
+enum_properties = other_call.call_args.args[2]["function"]["parameters"]["properties"]["candidates"]["items"]["properties"]
+for role in ("supported_by", "opposed_by", "unresolved"):
+    expected_ids = set(vocabulary.FINDINGS) | ({"other:0"} if role == "supported_by" else set())
+    check(f"proposal {role} schema restricts references to its catalog and supplemental enum",
+          set(enum_properties[role]["items"].get("enum", [])) == expected_ids)
+counted_response = {"candidates": [{"condition": "Offline condition",
+    "supported_by": ["fever", "other:0", "phantom_present", "cough"],
+    "opposed_by": ["cough", "fever", "phantom_absent"],
+    "unresolved": ["calf_swelling_unilateral", "phantom_unknown", "other:0"]}]}
+with patch.object(llm, "cached", return_value=counted_response), patch("sys.stdout", io.StringIO()) as id_log:
+    counted = propose.propose({"fever": True, "cough": False}, other_evidence)
+check("invalid proposal IDs are counted per run, distinguishing unknown from wrong-state references",
+      "propose: dropped IDs: 6 (unknown: 3, wrong state: 3)" in id_log.getvalue()
+      and counted[0]["supported_by"] == ["fever", "other:0"]
+      and counted[0]["opposed_by"] == ["cough"]
+      and counted[0]["unresolved"] == ["calf_swelling_unilateral"])
+with patch.object(llm, "cached", return_value={"candidates": []}), patch("sys.stdout", io.StringIO()) as zero_log:
+    propose.propose({"fever": True})
+    propose.propose({})
+check("proposal runs with no dropped IDs, including abstention, explicitly log zero",
+      zero_log.getvalue().count("propose: dropped IDs: 0 (unknown: 0, wrong state: 0)") == 2)
+
+
 # ===========================================================================
 section("reasoning uses only linked structured findings")
 reasoning_source = "for 3 days my ears have been ringing, and I have had hiccups since this morning."
@@ -1295,7 +1320,7 @@ with patch.dict(os.environ, {}, clear=True):
         check("unknown chat model names fail before a paid request", invalid_model_rejected)
 
 
-def offline_v2(replies, *, task="extract"):
+def offline_v2(replies, *, task="extract", tool=None):
     requests = []
 
     def respond(request):
@@ -1309,7 +1334,7 @@ def offline_v2(replies, *, task="extract"):
             patch.object(llm.time, "sleep"), \
             patch.dict(os.environ, {"SARVAM_API_KEY": "offline-test-key"}, clear=True):
         try:
-            return llm.call_tool("offline system", "offline input", extract._SCREEN_TOOL, task=task), requests, None
+            return llm.call_tool("offline system", "offline input", tool or extract._SCREEN_TOOL, task=task), requests, None
         except Exception as exc:
             return None, requests, exc
 
@@ -1325,6 +1350,16 @@ check("GLM uses the V2 endpoint with an explicit reasoning budget",
       and body["model"] == "glm5.3" and body["reasoning_effort"] == "high"
       and body["max_tokens"] == 16384 and body["temperature"] == 0 and body["seed"] == 0
       and body["tool_choice"]["function"]["name"] == extract._SCREEN_TOOL["function"]["name"])
+proposal_enum_tool = other_call.call_args.args[2]
+enum_reply = {"choices": [{"message": {"tool_calls": [{"function": {
+    "name": "propose_candidates", "arguments": json.dumps({"candidates": [dict(other_candidate,
+        supported_by=["other:0"], opposed_by=[], unresolved=["calf_swelling_unilateral"])]}),
+}}]}}]}
+enum_result, enum_requests, enum_error = offline_v2([(200, enum_reply)], task="propose", tool=proposal_enum_tool)
+check("the real V2 transport preserves nested proposal string enums and parses structured arguments",
+      enum_error is None and enum_requests[0][1]["tools"] == [proposal_enum_tool]
+      and enum_requests[0][1]["tool_choice"]["function"]["name"] == "propose_candidates"
+      and enum_result["candidates"][0]["supported_by"] == ["other:0"])
 result, requests, error = offline_v2([(200, v2_success)], task="screen")
 check("Gemma screening keeps its separate short nonreasoning request",
       result == screen_arguments and requests[0][1]["model"] == "gemma4"

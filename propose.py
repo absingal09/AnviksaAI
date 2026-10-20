@@ -42,6 +42,7 @@ applied to its output is a reviewed file rather than a generation. The
 reasoning below is the safety net, which is why every candidate must carry it.
 """
 
+import copy
 import json
 import re
 
@@ -163,17 +164,17 @@ _TOOL = {
                             },
                             "supported_by": {
                                 "type": "array",
-                                "items": {"type": "string"},
+                                "items": {"type": "string", "enum": sorted(vocabulary.FINDINGS)},
                                 "description": "Finding ids from PRESENT or ALSO NOTED (present, not in vocabulary) only.",
                             },
                             "opposed_by": {
                                 "type": "array",
-                                "items": {"type": "string"},
+                                "items": {"type": "string", "enum": sorted(vocabulary.FINDINGS)},
                                 "description": "Finding ids from the ABSENT list only.",
                             },
                             "unresolved": {
                                 "type": "array",
-                                "items": {"type": "string"},
+                                "items": {"type": "string", "enum": sorted(vocabulary.FINDINGS)},
                                 "description": (
                                     "Catalog finding ids only, currently UNKNOWN and "
                                     "whose answer would most change whether "
@@ -253,6 +254,7 @@ def propose(findings, other_findings=()):
     # how a panel ends up showing generic prior-driven suggestions styled as
     # though they came from this patient. Abstain instead, visibly.
     if not present and not other:
+        print("propose: dropped IDs: 0 (unknown: 0, wrong state: 0)")
         return []
 
     cache_key = llm.content_hash(llm.config_key('propose'), _PROMPT_VERSION, json.dumps(present),
@@ -273,12 +275,19 @@ def propose(findings, other_findings=()):
             f"({len(unknown)} of them):\n{render(unknown)}\n\n"
             "Call propose_candidates."
         )
-        return llm.call_tool(SYSTEM_PROMPT, user_content, _TOOL, task="propose")
+        # Sarvam's documented tool-parameter schemas support string enums.
+        # Supplemental IDs exist for support only; still validate responses
+        # below rather than assuming provider schema compliance.
+        tool = copy.deepcopy(_TOOL)
+        properties = tool["function"]["parameters"]["properties"]["candidates"]["items"]["properties"]
+        properties["supported_by"]["items"]["enum"] += sorted(other)
+        return llm.call_tool(SYSTEM_PROMPT, user_content, tool, task="propose")
 
     parsed = llm.cached(cpath, produce)
 
     present_set, absent_set = set(present) | set(other), set(absent)
     candidates = []
+    dropped_unknown = dropped_state = 0
     for raw in parsed.get("candidates") or []:
         condition = (raw.get("condition") or "").strip()
         if not condition:
@@ -307,6 +316,7 @@ def propose(findings, other_findings=()):
             accounted for them. Observed live. Both halves of the screen were
             wrong, and neither looked like a bug.
             """
+            nonlocal dropped_unknown, dropped_state
             out, dropped = [], []
             for item in raw.get(key) or []:
                 fid = _resolve(item, other)
@@ -315,6 +325,10 @@ def propose(findings, other_findings=()):
                         out.append(fid)
                 elif item:
                     dropped.append(item)
+                    if fid is None:
+                        dropped_unknown += 1
+                    else:
+                        dropped_state += 1
             if dropped:
                 # Printed, not swallowed. A candidate losing its evidence is
                 # invisible on screen — it just looks like a weak candidate.
@@ -348,6 +362,8 @@ def propose(findings, other_findings=()):
             "unresolved": unresolved,
         })
 
+    print(f"propose: dropped IDs: {dropped_unknown + dropped_state} "
+          f"(unknown: {dropped_unknown}, wrong state: {dropped_state})")
     return candidates
 
 
