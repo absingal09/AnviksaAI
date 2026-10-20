@@ -123,14 +123,13 @@ would most change whether this condition belongs on the list. Only ids from \
 the catalog that appear in neither the present nor the absent list. This is \
 the most useful field you produce: it is what lets the clinician be asked \
 one good question instead of twenty.
-- Never use a supplemental id in opposed_by or unresolved. In condition names \
-and reasoning, write its clinical text, never its internal id. Supplemental \
+- Never use a supplemental id in opposed_by or unresolved. In condition names, \
+write its clinical text, never its internal id. Supplemental \
 evidence does not change how severity or exclusions are decided.
-- reasoning: one or two sentences naming the actual findings. "Sudden \
-breathlessness with chest tightness in a patient on a combined oral \
-contraceptive after two days of bus travel" — not "clinical picture is \
-suggestive". A clinician who cannot check your reasoning cannot catch your \
-mistake, and there is nothing else here that would catch it."""
+- Do not write free-form reasoning. The application displays a factual template \
+filled only with the validated findings linked by supported_by and opposed_by. \
+Do not add unreported symptoms, laterality, illness history or qualifiers to \
+condition names."""
 
 _TOOL = {
     "type": "function",
@@ -162,15 +161,6 @@ _TOOL = {
                                     "would have to guess at."
                                 ),
                             },
-                            "reasoning": {
-                                "type": "string",
-                                "description": (
-                                    "One or two sentences naming the actual "
-                                    "findings that put this on the list. No "
-                                    "numbers, no percentages, no hedging "
-                                    "phrases that say nothing."
-                                ),
-                            },
                             "supported_by": {
                                 "type": "array",
                                 "items": {"type": "string"},
@@ -191,7 +181,7 @@ _TOOL = {
                                 ),
                             },
                         },
-                        "required": ["condition", "reasoning", "supported_by", "unresolved"],
+                        "required": ["condition", "supported_by", "unresolved"],
                     },
                 }
             },
@@ -291,9 +281,7 @@ def propose(findings, other_findings=()):
     candidates = []
     for raw in parsed.get("candidates") or []:
         condition = (raw.get("condition") or "").strip()
-        reasoning = (raw.get("reasoning") or "").strip()
-        # Require a named candidate and model reasoning before validation.
-        if not condition or not reasoning:
+        if not condition:
             continue
         # Tool citations belong in supported_by, not clinician-visible prose.
         # Never let even a fabricated supplemental id fall through as a label.
@@ -301,15 +289,7 @@ def propose(findings, other_findings=()):
             return re.sub(r"\bother:\d+\b", lambda match: other.get(match[0].lower(), "an unavailable finding"),
                           text, flags=re.IGNORECASE)
 
-        condition, reasoning = expand_ids(condition), expand_ids(reasoning)
-        if _UNSUPPORTED_REASONING.search(reasoning):
-            # Filter cached and new responses alike, retaining the candidate
-            # and its factual sentences. A decimal is not a sentence boundary.
-            sentences = re.split(r"(?<=[.!?])\s+", reasoning)
-            reasoning = " ".join(sentence for sentence in sentences
-                                 if not _UNSUPPORTED_REASONING.search(sentence))
-            if not reasoning:
-                reasoning = "Reasoning withheld: the model used numeric or probability wording."
+        condition = expand_ids(condition)
 
         def keep(key, allowed):
             """Resolve to real ids in the right state, then filter.
@@ -341,16 +321,31 @@ def propose(findings, other_findings=()):
                 print(f"propose: {condition!r} {key}: dropped {dropped}")
             return out
 
+        supported = keep("supported_by", present_set)
+        opposed = keep("opposed_by", absent_set)
+        unresolved = keep("unresolved", set(vocabulary.FINDINGS) - set(findings))
+        # Deterministic presentation, not a claim-verification heuristic:
+        # ignore ALL provider prose, including cached prose. This guarantees
+        # no additional patient facts in reasoning beyond the linked findings.
+        # It cannot guarantee extraction accuracy or the medical relevance of
+        # those links. Supplemental text itself is still model-written.
+        parts = []
+        if supported:
+            labels = [other[f] if f in other else vocabulary.label(f) for f in supported]
+            parts.append("Linked present findings: " + "; ".join(labels) + ".")
+        if opposed:
+            parts.append("Reported absent: " + "; ".join(vocabulary.label(f) for f in opposed) + ".")
+        reasoning = " ".join(parts) or "No supporting findings were linked to this candidate."
         candidates.append({
             "condition": condition,
             "reasoning": reasoning,
-            "supported_by": keep("supported_by", present_set),
-            "opposed_by": keep("opposed_by", absent_set),
+            "supported_by": supported,
+            "opposed_by": opposed,
             # Unresolved must be genuinely unknown: a real finding, and
             # neither present nor absent. Anything else produces a question
             # the patient has already answered, which is the bug this project
             # spent a whole build cycle on.
-            "unresolved": keep("unresolved", set(vocabulary.FINDINGS) - set(findings)),
+            "unresolved": unresolved,
         })
 
     return candidates

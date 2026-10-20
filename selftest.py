@@ -791,17 +791,34 @@ check("proposal schema and prompt invalidate its version alongside finding label
 
 
 # ===========================================================================
+section("reasoning uses only linked structured findings")
+reasoning_source = "for 3 days my ears have been ringing, and I have had hiccups since this morning."
+reasoning_response = {"present": [], "absent": [], "other": [
+    {"text": "Ringing in the ears for 3 days", "evidence": "for 3 days my ears have been ringing"},
+    {"text": "Hiccups since this morning", "evidence": "I have had hiccups since this morning."},
+]}
+reasoning_findings, _ = extracted_other(reasoning_response, transcript=reasoning_source)
+for invented in ("Recent viral illness with new tinnitus.", "Persistent unilateral tinnitus.",
+                 "Left ear tinnitus after a viral illness.", "Right ear tinnitus with hiccups."):
+    fixture = dict(other_candidate, reasoning=invented, supported_by=["other:0", "other:1"], unresolved=[])
+    grounded, _, _ = proposed_other(reasoning_findings[2], fixture)
+    text = grounded[0]["reasoning"] if grounded else ""
+    check(f"exact ringing-ears source cannot gain unsupported claims: {invented}",
+          bool(text) and not re.search(r"\b(?:viral|unilateral|left|right)\b", text, re.I)
+          and "Ringing in the ears for 3 days" in text and "Hiccups since this morning" in text)
+with patch.object(llm, "cached", return_value={"candidates": [dict(other_candidate, reasoning="", supported_by=[], unresolved=[])]}):
+    unlinked = propose.propose({}, other_evidence)
+check("a candidate without linked support gets an explicit neutral template instead of invented facts",
+      len(unlinked) == 1 and unlinked[0]["reasoning"] == "No supporting findings were linked to this candidate.")
+
+
+# ===========================================================================
 section("candidate reasoning does not invent certainty")
-withheld_reasoning = "Reasoning withheld: the model used numeric or probability wording."
-
-
 def reasoning_payload_is_clean(candidates):
     payload = json.dumps(eng.assess(candidates, FINDINGS), ensure_ascii=False)
-    # The fixed withholding notice explains the removal; it is not a model claim.
-    model_text = payload.replace(withheld_reasoning, "")
     return not re.search(
         r"[%％]|\b(?:percent(?:age)?|per\s+cent|probabilit(?:y|ies)|likelihood|confidence)\b"
-        r"|\bchance\s+of\b|\bp\s*(?:=|\()|\b\d+\.\d+\b", model_text, re.I)
+        r"|\bchance\s+of\b|\bp\s*(?:=|\()|\b\d+\.\d+\b", payload, re.I)
 
 
 for unsafe_reasoning in ["A 95% chance of PE", "The probability of PE is high.",
@@ -810,8 +827,11 @@ for unsafe_reasoning in ["A 95% chance of PE", "The probability of PE is high.",
     response = {"candidates": [dict(CANDIDATES[0], reasoning=unsafe_reasoning), CANDIDATES[1]]}
     with patch.object(propose.llm, "cached", return_value=response):
         checked_candidates = propose.propose(FINDINGS)
-    check(f"unsafe reasoning is withheld without losing its candidate: {unsafe_reasoning}",
-          checked_candidates == [dict(CANDIDATES[0], reasoning=withheld_reasoning), CANDIDATES[1]])
+    check(f"provider probability prose is ignored without losing candidates or evidence: {unsafe_reasoning}",
+          len(checked_candidates) == 2
+          and [c["condition"] for c in checked_candidates] == [c["condition"] for c in CANDIDATES[:2]]
+          and checked_candidates[0]["supported_by"] == CANDIDATES[0]["supported_by"]
+          and checked_candidates[0]["reasoning"].startswith("Linked present findings:"))
     check(f"unsupported claim cannot reach the payload: {unsafe_reasoning}",
           reasoning_payload_is_clean(checked_candidates))
 
@@ -819,15 +839,17 @@ mixed_reasoning = "A 95% chance of PE. Sudden breathlessness after a long journe
 with patch.object(propose.llm, "cached", return_value={
         "candidates": [dict(CANDIDATES[0], reasoning=mixed_reasoning)]}):
     checked_candidates = propose.propose(FINDINGS)
-check("only the unsupported sentence is removed, preserving candidate evidence",
-      checked_candidates == [dict(CANDIDATES[0], reasoning="Sudden breathlessness after a long journey.")])
+check("all mixed provider prose is replaced by a template retaining linked evidence",
+      len(checked_candidates) == 1 and checked_candidates[0]["supported_by"] == CANDIDATES[0]["supported_by"]
+      and checked_candidates[0]["reasoning"].startswith("Linked present findings:"))
 check("mixed reasoning cannot leak a percentage or probability claim into the payload",
       reasoning_payload_is_clean(checked_candidates))
 
 with patch.object(propose.llm, "cached", return_value={"candidates": [CANDIDATES[0]]}):
     checked_candidates = propose.propose(FINDINGS)
-check("factual candidate reasoning survives validation",
-      len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] == CANDIDATES[0]["reasoning"])
+check("the factual template contains exactly the linked present findings",
+      len(checked_candidates) == 1 and checked_candidates[0]["reasoning"] ==
+      "Linked present findings: " + "; ".join(vocabulary.label(f) for f in CANDIDATES[0]["supported_by"]) + ".")
 
 
 # ===========================================================================
