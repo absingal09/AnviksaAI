@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 python-multipart
 python-dotenv
-sarvamai
+# OCR uses the digitise(output_format=...) contract verified with this SDK.
+sarvamai==0.1.30
 httpx
 pyyaml
