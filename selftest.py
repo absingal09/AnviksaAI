@@ -1404,6 +1404,50 @@ for task, invoke, cached_value in [
 
 
 # ===========================================================================
+section("uncached OCR uses the installed SDK contract without network")
+ocr_requests = []
+
+
+def offline_ocr(request):
+    ocr_requests.append((request.method, request.url.path, request.read()))
+    if request.method == "POST" and request.url.path.endswith("/job/digitise"):
+        return httpx.Response(201, json={"job_id": "offline-ocr", "status": "queued", "run_id": "offline-run"})
+    if request.method == "GET" and request.url.path.endswith("/offline-ocr/status"):
+        return httpx.Response(200, json={"job_id": "offline-ocr", "status": "completed", "pipeline": "digitise",
+            "usage": {}, "created_at": "2026-10-21T00:00:00Z", "updated_at": "2026-10-21T00:00:00Z"})
+    if request.method == "GET" and request.url.path.endswith("/offline-ocr/results"):
+        return httpx.Response(200, json={"type": "digitise", "job_id": "offline-ocr", "status": "completed",
+            "usage": {}, "documents": [{"pages": [{"blocks": [{"text": "Offline prescription"}]}]}]})
+    raise AssertionError(f"Unexpected offline OCR request: {request.method} {request.url.path}")
+
+
+with tempfile.TemporaryDirectory(dir=ROOT / "cache", prefix="selftest-ocr-sdk-") as ocr_test_dir:
+    image_path = Path(ocr_test_dir) / "offline.png"
+    image_path.write_bytes(b"offline image fixture")
+    # Use the actual Sarvam client so mocks cannot hide an incompatible
+    # digitise() signature. Only HTTP responses are faked; no paid calls.
+    with httpx.Client(transport=httpx.MockTransport(offline_ocr)) as transport, \
+            patch.object(capture, "CACHE_DIR", Path(ocr_test_dir)), patch.object(capture.time, "sleep"), \
+            patch.object(capture, "client", return_value=llm.SarvamAI(
+                api_subscription_key="offline-test-key", httpx_client=transport)):
+        try:
+            ocr_result = capture.read_image(image_path)
+            cached_ocr_result = capture.read_image(image_path)
+            ocr_error = None
+        except Exception as exc:
+            ocr_result, cached_ocr_result, ocr_error = {}, {}, repr(exc)
+check("uncached OCR accepts its real SDK arguments and decodes the job results",
+      ocr_error is None and ocr_result == {"blocks": ["Offline prescription"], "text": "Offline prescription"},
+      ocr_error or str(ocr_result))
+check("OCR uploads Markdown settings and polls the job before fetching results",
+      [method for method, _, _ in ocr_requests] == ["POST", "GET", "GET"]
+      and b'name="output_format"' in ocr_requests[0][2] and b"\r\nmd\r\n" in ocr_requests[0][2],
+      ocr_error or str([(method, path) for method, path, _ in ocr_requests]))
+check("repeating OCR reads the cache without another SDK request",
+      ocr_error is None and cached_ocr_result == ocr_result and len(ocr_requests) == 3)
+
+
+# ===========================================================================
 section("capture model selection and model-aware caches stay offline")
 with patch.dict(os.environ, {}, clear=True):
     check("Hindi and English use their own documented v4 voices",
